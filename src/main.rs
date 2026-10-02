@@ -134,32 +134,53 @@ fn mouse_scroll_kind(kind: MouseEventKind) -> bool {
     matches!(kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp)
 }
 
+fn keyboard_enhancement_requested() -> bool {
+    if std::env::var_os("CRABCODE_DISABLE_KEYBOARD_ENHANCEMENT").is_some() {
+        return false;
+    }
+
+    // crossterm's Windows event source decodes WinAPI `KEY_EVENT_RECORD`s and has no
+    // parser for the kitty keyboard protocol, and it hard-refuses to even emit the
+    // push sequence there (`is_ansi_code_supported() == false`,
+    // `execute_winapi()` -> `ErrorKind::Unsupported`). Asking for it on Windows always
+    // fails, so never request it: startup must not depend on it.
+    !cfg!(windows)
+}
+
+/// Enters the TUI modes and reports whether keyboard enhancement is actually active.
+///
+/// A rejected push degrades to plain key events instead of aborting startup, and the
+/// caller learns about it so the matching pop is only sent when a push succeeded.
 fn apply_terminal_enter_modes<W: std::io::Write>(
     writer: &mut W,
     keyboard_enhancement: bool,
-) -> Result<()> {
-    if keyboard_enhancement {
-        execute!(
-            writer,
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableFocusChange,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
-            ),
-            EnableBracketedPaste
-        )?;
-    } else {
-        execute!(
-            writer,
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableFocusChange,
-            EnableBracketedPaste
-        )?;
+) -> Result<bool> {
+    execute!(
+        writer,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableFocusChange,
+        EnableBracketedPaste
+    )?;
+
+    if !keyboard_enhancement {
+        return Ok(false);
     }
-    Ok(())
+
+    let pushed = execute!(
+        writer,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+        ),
+    )
+    .is_ok();
+
+    if !pushed {
+        push_startup_diag("keyboard enhancement unavailable; using plain key events".to_string());
+    }
+
+    Ok(pushed)
 }
 
 fn restore_terminal_modes(
@@ -169,11 +190,13 @@ fn restore_terminal_modes(
     drain_pending_terminal_events(Duration::from_millis(0));
 
     let restore_result = if keyboard_enhancement {
+        // Best-effort: the pop is only meaningful when a push succeeded, and a failure
+        // here must not turn a clean exit into a crash report.
+        let _ = execute!(backend, PopKeyboardEnhancementFlags);
         execute!(
             backend,
             DisableMouseCapture,
             DisableFocusChange,
-            PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
             LeaveAlternateScreen
         )
@@ -211,14 +234,15 @@ fn run_shell_command_blocking(command: &str) -> io::Result<std::process::ExitSta
 
 fn suspend_and_run_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    keyboard_enhancement: bool,
+    keyboard_enhancement: &mut bool,
     command: &str,
 ) -> Result<()> {
-    restore_terminal_modes(terminal.backend_mut(), keyboard_enhancement)?;
+    restore_terminal_modes(terminal.backend_mut(), *keyboard_enhancement)?;
     let _ = terminal.show_cursor();
     let status = run_shell_command_blocking(command);
     enable_raw_mode()?;
-    apply_terminal_enter_modes(terminal.backend_mut(), keyboard_enhancement)?;
+    *keyboard_enhancement =
+        apply_terminal_enter_modes(terminal.backend_mut(), *keyboard_enhancement)?;
     let _ = terminal.hide_cursor();
     let _ = terminal.clear();
     drain_pending_terminal_events(Duration::from_millis(0));
@@ -1245,9 +1269,9 @@ async fn main() -> Result<()> {
     let mut stdout = io::stdout();
 
     // Skip blocking supports_keyboard_enhancement() CSI probe (Codex pattern).
-    // Always push flags; terminals that ignore them are fine. Opt out via env.
-    let keyboard_enhancement = std::env::var_os("CRABCODE_DISABLE_KEYBOARD_ENHANCEMENT").is_none();
-    apply_terminal_enter_modes(&mut stdout, keyboard_enhancement)?;
+    // Push flags where they can work; opt out via env.
+    let mut keyboard_enhancement = keyboard_enhancement_requested();
+    keyboard_enhancement = apply_terminal_enter_modes(&mut stdout, keyboard_enhancement)?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -1258,7 +1282,7 @@ async fn main() -> Result<()> {
         &mut app,
         session_history_loaded,
         startup_hydrated,
-        keyboard_enhancement,
+        &mut keyboard_enhancement,
     )
     .await;
     let remote_launch_request = app.take_remote_launch_request();
@@ -1302,6 +1326,26 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_enter_modes_never_fail_on_unsupported_keyboard_enhancement() {
+        let requested = keyboard_enhancement_requested();
+
+        let mut sink: Vec<u8> = Vec::new();
+        let pushed =
+            apply_terminal_enter_modes(&mut sink, true).expect("enter modes must not fail");
+
+        // crossterm refuses the kitty protocol on Windows, so enhancement must be
+        // reported as inactive there instead of aborting startup.
+        assert_eq!(pushed, requested && !cfg!(windows));
+
+        let mut sink: Vec<u8> = Vec::new();
+        assert!(!apply_terminal_enter_modes(&mut sink, false).expect("enter modes must not fail"));
+        assert!(
+            String::from_utf8_lossy(&sink).contains("\u{1b}[?1049h"),
+            "alternate screen must still be entered without enhancement"
+        );
+    }
 
     #[test]
     fn print_output_separates_tool_preambles_from_final_answer() {
@@ -1718,7 +1762,7 @@ async fn run_event_loop(
     app: &mut App,
     mut session_history_loaded: bool,
     mut startup_hydrated: bool,
-    keyboard_enhancement: bool,
+    keyboard_enhancement: &mut bool,
 ) -> Result<()> {
     // Adaptive poll: fast for home blink / streaming, park nearly forever when idle.
     // A short "idle" poll still burns needless redraws/sec; block until input instead.

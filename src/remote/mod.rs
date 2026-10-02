@@ -767,33 +767,32 @@ struct TerminalModeGuard {
 impl TerminalModeGuard {
     fn enter() -> Result<Self> {
         let mut stdout = io::stdout();
-        let keyboard_enhancement = supports_keyboard_enhancement()?;
+        // A failed probe must not abort the remote TUI; plain key events are a fine fallback.
+        let mut keyboard_enhancement = supports_keyboard_enhancement().unwrap_or(false);
         enable_raw_mode()?;
-        let enter_result = if keyboard_enhancement {
-            execute!(
-                stdout,
-                EnterAlternateScreen,
-                EnableMouseCapture,
-                EnableFocusChange,
-                PushKeyboardEnhancementFlags(
-                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
-                ),
-                EnableBracketedPaste
-            )
-        } else {
-            execute!(
-                stdout,
-                EnterAlternateScreen,
-                EnableMouseCapture,
-                EnableFocusChange,
-                EnableBracketedPaste
-            )
-        };
+        let enter_result = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableFocusChange,
+            EnableBracketedPaste
+        );
 
         if let Err(err) = enter_result {
             let _ = disable_raw_mode();
             return Err(err).context("failed to enter terminal alternate screen");
+        }
+
+        // Best-effort: a rejected enhancement push degrades to plain key events.
+        if keyboard_enhancement {
+            keyboard_enhancement = execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+                ),
+            )
+            .is_ok();
         }
 
         Ok(Self {
@@ -808,23 +807,18 @@ impl Drop for TerminalModeGuard {
 
         let mut stdout = io::stdout();
         if self.keyboard_enhancement {
-            let _ = execute!(
-                stdout,
-                DisableMouseCapture,
-                DisableFocusChange,
-                PopKeyboardEnhancementFlags,
-                DisableBracketedPaste,
-                LeaveAlternateScreen
-            );
-        } else {
-            let _ = execute!(
-                stdout,
-                DisableMouseCapture,
-                DisableFocusChange,
-                DisableBracketedPaste,
-                LeaveAlternateScreen
-            );
+            // The whole restore is best-effort (`let _ =`), so keep the pop in its own
+            // statement: it is unsupported on the legacy Windows console path and must
+            // not prevent the remaining modes from being reset.
+            let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         }
+        let _ = execute!(
+            stdout,
+            DisableMouseCapture,
+            DisableFocusChange,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
         let _ = stdout.flush();
 
         drain_pending_terminal_events(Duration::from_millis(25));
