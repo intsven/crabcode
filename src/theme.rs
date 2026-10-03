@@ -774,8 +774,14 @@ impl Theme {
                 let error_color = resolve_or("error", primary);
                 let diff_add = resolve_or("diffAdd", success_color);
                 let diff_remove = resolve_or("diffDelete", error_color);
-                let diff_add_bg = resolve_or("diffAddedBg", success_color);
-                let diff_remove_bg = resolve_or("diffRemovedBg", error_color);
+                // Diff backgrounds honor an explicit transparent declaration.
+                // Falling back to the solid success/error color would paint the
+                // diff foreground onto an identical background (unreadable), so
+                // this distinguishes "key absent" from "declared transparent".
+                let diff_add_bg =
+                    resolve_diff_background(theme, "diffAddedBg", dark).unwrap_or(success_color);
+                let diff_remove_bg =
+                    resolve_diff_background(theme, "diffRemovedBg", dark).unwrap_or(error_color);
                 let diff_gutter = text_weak;
 
                 ThemeColors {
@@ -867,6 +873,43 @@ fn resolve_tui_color(theme: &TuiTheme, key: &str, dark: bool) -> ratatui::style:
         return ratatui::style::Color::Reset;
     };
     parse_hex(def)
+}
+
+/// Resolve a diff background, returning `Some(Color::Reset)` when the theme
+/// explicitly asks for transparency with the literal value `none`.
+///
+/// [`resolve_tui_color`] collapses every unresolvable value to `Color::Reset`,
+/// which is indistinguishable from "declared transparent" by itself, so the
+/// generic `resolve_or` fallback would replace it with an opaque color. Only
+/// the exact token `none` is treated as a transparency request; every other
+/// unresolvable value (`transparent`, a dangling `defs` reference) keeps the
+/// previous opaque fallback so no existing theme changes appearance.
+fn resolve_diff_background(
+    theme: &TuiTheme,
+    key: &str,
+    dark: bool,
+) -> Option<ratatui::style::Color> {
+    let raw = match theme.theme.get(key)? {
+        TuiThemeValue::Str(s) => s.trim(),
+        TuiThemeValue::Mode { dark: d, light: l } => {
+            if dark {
+                d.trim()
+            } else {
+                l.trim()
+            }
+        }
+    };
+
+    if raw.eq_ignore_ascii_case("none") {
+        return Some(ratatui::style::Color::Reset);
+    }
+
+    let resolved = resolve_tui_color(theme, key, dark);
+    if resolved == ratatui::style::Color::Reset {
+        None
+    } else {
+        Some(resolved)
+    }
 }
 
 fn parse_hex(hex: &str) -> ratatui::style::Color {
@@ -967,6 +1010,98 @@ mod tests {
             colors.background,
             ratatui::style::Color::Reset,
             "lucent-orng should paint a solid bg by default"
+        );
+    }
+
+    #[test]
+    fn diff_backgrounds_honor_explicit_transparency() {
+        // "none" must stay transparent rather than collapsing to the solid
+        // success color, which would put diff text on its own background.
+        let clear = Theme::load_from_str(
+            r##"{"defs":{},"theme":{
+                "success":"#A3BE8C","error":"#BF616A",
+                "diffAddedBg":"none","diffRemovedBg":"none"}}"##,
+            "t",
+        )
+        .unwrap();
+        let c = clear.get_colors(true);
+        assert_eq!(c.diff_add_bg, ratatui::style::Color::Reset);
+        assert_eq!(c.diff_remove_bg, ratatui::style::Color::Reset);
+        // Foreground must not be dragged along into transparency.
+        assert_ne!(c.diff_add, ratatui::style::Color::Reset);
+        assert_ne!(c.diff_remove, ratatui::style::Color::Reset);
+        // fg != bg is what actually makes the line readable.
+        assert_ne!(c.diff_add, c.diff_add_bg);
+        assert_ne!(c.diff_remove, c.diff_remove_bg);
+    }
+
+    #[test]
+    fn diff_backgrounds_stay_opaque_when_declared() {
+        // Explicit hex must remain fully opaque.
+        let opaque = Theme::load_from_str(
+            r##"{"defs":{},"theme":{
+                "success":"#A3BE8C","error":"#BF616A",
+                "diffAddedBg":"#1F3D24","diffRemovedBg":"#3D1F24"}}"##,
+            "t",
+        )
+        .unwrap();
+        let c = opaque.get_colors(true);
+        assert_eq!(
+            c.diff_add_bg,
+            ratatui::style::Color::Rgb(0x1F, 0x3D, 0x24)
+        );
+        assert_eq!(
+            c.diff_remove_bg,
+            ratatui::style::Color::Rgb(0x3D, 0x1F, 0x24)
+        );
+    }
+
+    #[test]
+    fn absent_diff_backgrounds_keep_prior_fallback() {
+        // No diff*Bg keys at all -> unchanged legacy behavior (solid success/error).
+        let t = Theme::load_from_str(
+            r##"{"defs":{},"theme":{"success":"#A3BE8C","error":"#BF616A"}}"##,
+            "t",
+        )
+        .unwrap();
+        let c = t.get_colors(true);
+        assert_eq!(c.diff_add_bg, ratatui::style::Color::Rgb(0xA3, 0xBE, 0x8C));
+        assert_eq!(c.diff_remove_bg, ratatui::style::Color::Rgb(0xBF, 0x61, 0x6A));
+    }
+
+    #[test]
+    fn no_bundled_theme_regresses_on_diff_backgrounds() {
+        // Guard the "do not change other themes" requirement: every bundled
+        // theme's diff backgrounds must be identical before/after this change,
+        // i.e. still whatever they were, and never Reset unless declared.
+        for theme in Theme::bundled_themes() {
+            let c = theme.get_colors(true);
+            assert_ne!(
+                c.diff_add_bg,
+                ratatui::style::Color::Reset,
+                "bundled theme {} unexpectedly lost its added-line background",
+                theme.id
+            );
+            assert_ne!(
+                c.diff_remove_bg,
+                ratatui::style::Color::Reset,
+                "bundled theme {} unexpectedly lost its removed-line background",
+                theme.id
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_transparent_token_keeps_opaque_fallback() {
+        // lucent-orng declares the literal string `"transparent"`, which is NOT
+        // the `none` token. It must keep its previous opaque fallback.
+        let themes = Theme::bundled_themes();
+        let lucent = themes.iter().find(|t| t.id == "lucent-orng").unwrap();
+        let c = lucent.get_colors(true);
+        assert_ne!(
+            c.diff_add_bg,
+            ratatui::style::Color::Reset,
+            "the `transparent` token must not be reinterpreted as `none`"
         );
     }
 
