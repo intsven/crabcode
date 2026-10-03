@@ -645,6 +645,44 @@ impl HistoryDAO {
         Ok(())
     }
 
+    /// Look up a session by its stable identifier (`sessions.session_identifier`).
+    /// `session_identifier` carries a unique index, so this never scans.
+    pub fn get_session_by_identifier(&self, identifier: &str) -> Result<Option<Session>> {
+        let row_id = self
+            .conn
+            .query_row(
+                "SELECT id FROM sessions WHERE session_identifier = ?1",
+                params![identifier],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        match row_id {
+            Some(id) => Ok(self.get_session(id)?),
+            None => Ok(None),
+        }
+    }
+
+    /// Backdate a session to the timestamps it was originally created/updated.
+    /// Used by importers, which carry real timestamps from a foreign store
+    /// instead of letting `create_session` stamp `now()`.
+    pub fn set_session_times(&self, id: i64, created_at: i64, updated_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions
+             SET created_at = ?1,
+                 updated_at = ?2,
+                 total_time_sec = ?3,
+                 avg_tokens_per_sec = CASE WHEN ?3 > 0.0 THEN total_tokens / ?3 ELSE 0.0 END
+             WHERE id = ?4",
+            params![
+                created_at,
+                updated_at,
+                (updated_at - created_at).max(0) as f64,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn set_session_status(
         &self,
         id: i64,

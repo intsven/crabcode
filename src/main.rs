@@ -10,6 +10,7 @@ mod command;
 mod completion;
 mod config;
 mod herdr;
+mod import;
 mod jobs;
 mod llm;
 mod logging;
@@ -904,6 +905,24 @@ enum Command {
         command: MaintenanceCommand,
     },
 
+    /// Import an opencode session transcript (`opencode export` JSON) into history
+    Import {
+        /// Path to the export JSON, or `-` to read stdin
+        source: String,
+
+        /// Import into this workspace root instead of the session's own directory
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<String>,
+
+        /// Report what would be imported without writing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Replace an existing session with the same identifier
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Manage MCP servers (list / auth / logout)
     Mcp {
         #[command(subcommand)]
@@ -1185,6 +1204,19 @@ async fn main() -> Result<()> {
                 }
             }
             return Ok(());
+        }
+        Some(Command::Import {
+            source,
+            workspace,
+            dry_run,
+            force,
+        }) => {
+            return crate::import::run(crate::import::ImportOptions {
+                source: source.clone(),
+                workspace: workspace.clone(),
+                dry_run: *dry_run,
+                force: *force,
+            });
         }
         Some(Command::Mcp { command }) => {
             let cli = match command {
