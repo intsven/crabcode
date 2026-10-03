@@ -80,6 +80,10 @@ struct ParsedMessage {
     agent_mode: Option<String>,
     tokens_used: i64,
     output_tokens: Option<i64>,
+    input_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
+    cost: Option<f64>,
     tokens_per_sec: Option<f64>,
     parts: Vec<MessagePart>,
 }
@@ -356,6 +360,11 @@ fn map_message(raw: &JsonValue, index: usize, stats: &mut PartStats) -> Option<P
         agent_mode,
         tokens_used,
         output_tokens: (output > 0).then_some(output as i64),
+        input_tokens: (input > 0).then_some(input as i64),
+        cache_read_tokens: (cache_read > 0).then_some(cache_read as i64),
+        cache_write_tokens: (cache_write > 0).then_some(cache_write as i64),
+        // opencode reports cost per message in `info.cost`.
+        cost: info.get("cost").and_then(JsonValue::as_f64),
         tokens_per_sec,
         parts,
     })
@@ -548,6 +557,12 @@ pub fn run(options: ImportOptions) -> Result<()> {
             t1_ms: None,
             tn_ms: None,
             output_tokens: message.output_tokens,
+            input_tokens: message.input_tokens,
+            cache_read_tokens: message.cache_read_tokens,
+            cache_write_tokens: message.cache_write_tokens,
+            cost: message.cost,
+            // opencode's own export is authoritative about usage.
+            usage_authoritative: true,
             tokens_per_sec: message.tokens_per_sec,
         })
         .collect();
