@@ -392,6 +392,13 @@ impl SessionManager {
         self.hydrated_sessions.insert(session_id.clone());
         self.message_counts.insert(session_id.clone(), 0);
 
+        // A brand new session becomes current without any status transition, so
+        // herdr would keep showing the previous session's id (and resume
+        // command) until the first turn. Report it as soon as it is current.
+        if make_current {
+            crate::herdr::report_session_status(&session_id, SessionStatus::Idle);
+        }
+
         session_id
     }
 
@@ -535,7 +542,7 @@ impl SessionManager {
                 .get(id)
                 .map(|s| s.status)
                 .unwrap_or(SessionStatus::Idle);
-            crate::herdr::report_session_status(status);
+            crate::herdr::report_session_status(id, status);
             true
         } else {
             false
@@ -812,7 +819,7 @@ impl SessionManager {
 
         // Only the active pane session drives herdr's agent state.
         if self.current_session_id.as_deref() == Some(id) {
-            crate::herdr::report_session_status(status);
+            crate::herdr::report_session_status(id, status);
         }
 
         Ok(())

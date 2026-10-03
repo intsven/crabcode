@@ -10766,6 +10766,7 @@ impl App {
             }
             crate::llm::ChunkMessage::PermissionRequest(prompt) => {
                 self.maybe_persist_streaming_snapshot_for_session(session_id, true);
+                crate::herdr::set_block_message("Permission needed");
                 let _ = self.session_manager.set_session_status(
                     session_id,
                     crate::session::types::SessionStatus::Waiting,
@@ -10796,6 +10797,7 @@ impl App {
                 response_tx,
             } => {
                 self.maybe_persist_streaming_snapshot_for_session(session_id, true);
+                crate::herdr::set_block_message("Question needs an answer");
                 let _ = self.session_manager.set_session_status(
                     session_id,
                     crate::session::types::SessionStatus::Waiting,
@@ -10823,6 +10825,7 @@ impl App {
             }
             crate::llm::ChunkMessage::TerminalSessionRequest(request) => {
                 self.maybe_persist_streaming_snapshot_for_session(session_id, true);
+                crate::herdr::set_block_message("Terminal session request");
                 let _ = self.session_manager.set_session_status(
                     session_id,
                     crate::session::types::SessionStatus::Waiting,
