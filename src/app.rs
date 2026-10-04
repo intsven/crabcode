@@ -1035,6 +1035,10 @@ struct StreamingUsageBase {
     session_id: Option<String>,
     message_count: usize,
     streaming_idx: Option<usize>,
+    /// Active-context boundary when this base was computed. Compaction
+    /// rewrites history without necessarily changing `message_count`, so the
+    /// boundary has to be part of the cache key.
+    context_start: usize,
     base_tokens: usize,
 }
 
@@ -2934,6 +2938,12 @@ impl App {
         let streaming_idx = messages.iter().rposition(|message| {
             message.role == crate::session::types::MessageRole::Assistant && !message.is_complete
         });
+        // Soft compaction keeps pre-boundary history in the transcript for the
+        // UI and the DB but never sends it to the model, so the counter must
+        // start at the boundary exactly like `total_context_tokens` does.
+        // Summing the whole transcript here reported ~1.2M (112%) for a
+        // session whose real context was 21K.
+        let context_start = crate::session::compaction::context_start_index(messages);
 
         let cache_valid = self
             .cached_usage_streaming_base
@@ -2942,18 +2952,21 @@ impl App {
                 base.session_id == session_id
                     && base.message_count == message_count
                     && base.streaming_idx == streaming_idx
+                    && base.context_start == context_start
             });
         if !cache_valid {
             let base_tokens = messages
                 .iter()
+                .skip(context_start)
                 .enumerate()
-                .filter(|(idx, _)| Some(*idx) != streaming_idx)
+                .filter(|(idx, _)| Some(context_start + *idx) != streaming_idx)
                 .map(|(_, message)| crate::session::compaction::message_context_tokens(message))
                 .sum();
             self.cached_usage_streaming_base = Some(StreamingUsageBase {
                 session_id,
                 message_count,
                 streaming_idx,
+                context_start,
                 base_tokens,
             });
         }
@@ -17734,6 +17747,77 @@ mod tests {
             "cache should refresh when the message count changes"
         );
         assert!(expected_after > expected);
+    }
+
+    #[test]
+    fn streaming_usage_base_excludes_pre_compaction_history() {
+        // Soft compaction keeps pre-boundary history in the transcript but
+        // excludes it from the model context. The streaming counter must agree
+        // with total_context_tokens, which starts at the summary — otherwise the
+        // footer reports the whole transcript while the model sees a fraction.
+        use crate::session::compaction::{
+            apply_soft_compaction, context_start_index, total_context_tokens,
+        };
+
+        let mut app = test_app();
+
+        // Six pre-boundary messages, each ~1k tokens.
+        let mut messages: Vec<crate::session::types::Message> = Vec::new();
+        for i in 0..6 {
+            let mut m = crate::session::types::Message::user(format!("old message {i}"));
+            m.token_count = Some(1_000);
+            messages.push(m);
+        }
+
+        let selection = crate::session::compaction::CompactionSelection {
+            summarize_end: messages.len(),
+            tail_messages: Vec::new(),
+            messages_to_summarize: messages.clone(),
+        };
+        let stats = crate::session::types::CompactionStats {
+            before_tokens: 6_000,
+            after_tokens: 0,
+            before_messages: 6,
+            after_messages: 0,
+        };
+        let compacted = apply_soft_compaction(
+            &messages,
+            &selection,
+            "short summary",
+            None,
+            None,
+            None,
+            stats,
+        );
+
+        // Sanity: layout is [history*6][summary][marker], so the active
+        // context starts at the summary.
+        assert_eq!(context_start_index(&compacted), 6);
+
+        for message in compacted {
+            app.chat_state.chat.add_message(message);
+        }
+        // Add an in-flight streaming message so the streaming path is taken.
+        app.chat_state
+            .chat
+            .add_message(crate::session::types::Message::incomplete("streaming..."));
+
+        // `total_context_tokens` estimates the in-flight message from its
+        // content; the streaming path uses the chat's incremental counter. The
+        // two agree only to within that estimate, so compare loosely and pin
+        // the substantive claim below.
+        let expected = total_context_tokens(&app.chat_state.chat.messages);
+        let actual = app.streaming_context_tokens_cached();
+
+        let slack = expected / 2 + 16;
+        assert!(
+            actual.abs_diff(expected) <= slack,
+            "streaming counter must track the post-boundary context (got {actual}, want ~{expected})"
+        );
+        assert!(
+            actual < 6_000,
+            "streaming counter must not include the 6k of dropped history, got {actual}"
+        );
     }
 
     #[test]
