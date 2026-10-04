@@ -1,4 +1,5 @@
 use crate::theme::{contrast_text, ThemeColors};
+use crate::ui::textarea_keys::altgr_char;
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -1044,6 +1045,12 @@ pub fn handle_question_dialog_key_event(
                     QuestionDialogAction::Handled
                 }
             }
+        }
+        // AltGr (CONTROL+ALT on Windows) types literal text such as `@` or `\`;
+        // the guard below must not swallow it as if it were a Ctrl/Alt binding.
+        KeyCode::Char(ch) if altgr_char(&event).is_some() => {
+            request.insert_char(ch);
+            QuestionDialogAction::Handled
         }
         KeyCode::Char(ch)
             if !event.modifiers.contains(KeyModifiers::CONTROL)

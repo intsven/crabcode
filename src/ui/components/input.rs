@@ -5,7 +5,7 @@ use crate::theme::{agent_color, contrast_text, ThemeColors};
 use crate::toast::{Toast, ToastLevel};
 use crate::ui::selection::EdgeScrollDirection;
 use crate::ui::textarea_keys::{
-    command_backspace_to_line_start as textarea_command_backspace_to_line_start,
+    altgr_char, command_backspace_to_line_start as textarea_command_backspace_to_line_start,
     delete_to_line_start as textarea_delete_to_line_start, has_command_modifier,
 };
 use crate::utils::image_attachment;
@@ -900,7 +900,14 @@ impl Input {
             _ => {
                 self.reveal_cursor_after_key_input();
                 self.preferred_visual_col = None;
-                self.textarea.input(input);
+                // AltGr characters (`@`, `\`, `|`, ...) arrive as Char with
+                // CONTROL+ALT and tui-textarea drops those; insert them literally.
+                match altgr_char(&event) {
+                    Some(c) => self.textarea.insert_char(c),
+                    None => {
+                        self.textarea.input(input);
+                    }
+                }
                 self.sync_image_placeholders();
                 self.sync_pending_pastes();
                 true
