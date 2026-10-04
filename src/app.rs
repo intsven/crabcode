@@ -7230,6 +7230,28 @@ impl App {
         self.start_compact_session_with_min(session_id, 0);
     }
 
+    /// Token budget for a single summarization request.
+    ///
+    /// The transcript head is serialized into one request, so it must fit the
+    /// active model's context window with room left for the summary itself.
+    /// Falls back to a conservative constant when the window is unknown.
+    fn compaction_prompt_budget(&self) -> usize {
+        const FALLBACK: usize = 100_000;
+
+        self.discovery
+            .as_ref()
+            .and_then(|discovery| {
+                discovery.get_model_limit(&self.provider_name.to_lowercase(), &self.model)
+            })
+            .filter(|limit| *limit > 0)
+            .map(|limit| {
+                (limit as usize)
+                    .saturating_sub(crate::session::compaction::DEFAULT_RESERVED_TOKENS as usize)
+            })
+            .filter(|budget| *budget > 0)
+            .unwrap_or(FALLBACK)
+    }
+
     fn start_compact_session_with_min(&mut self, session_id: &str, minimum_tokens: usize) {
         if self.compaction_receiver.is_some() {
             push_toast(Toast::new(
@@ -7280,7 +7302,10 @@ impl App {
         let before_tokens = crate::session::compaction::total_context_tokens(&messages);
         let before_messages =
             crate::session::compaction::filter_messages_for_context(&messages).len();
-        let prompt = crate::session::compaction::build_prompt(&selection.messages_to_summarize);
+        let prompt = crate::session::compaction::build_prompt_within(
+            &selection.messages_to_summarize,
+            self.compaction_prompt_budget(),
+        );
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<CompactionTaskMessage>();
         self.compaction_receiver = Some(receiver);

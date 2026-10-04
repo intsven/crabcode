@@ -56,6 +56,28 @@ Rules:
 
 const TOOL_OUTPUT_MAX_CHARS: usize = 2_000;
 
+/// Real tokens per `estimate_tokens` unit, in percent.
+///
+/// Measured with cl100k_base over a real session transcript: 1,200,614 actual
+/// tokens against 892,015 from the 4-chars-per-token estimate (~1.35x).
+const PROMPT_TOKEN_RATIO_PCT: u64 = 135;
+
+/// Additional safety margin on top of the ratio correction, in percent.
+const PROMPT_TOKEN_HEADROOM_PCT: u64 = 90;
+
+/// Convert a token budget into a char budget for [`build_prompt_within`].
+fn prompt_budget_chars(max_tokens: usize) -> usize {
+    let ratio = PROMPT_TOKEN_RATIO_PCT.max(100);
+    let headroom = PROMPT_TOKEN_HEADROOM_PCT.max(1);
+
+    (max_tokens as u64)
+        .saturating_mul(4)
+        .saturating_mul(100)
+        .saturating_mul(headroom)
+        .saturating_div(ratio.saturating_mul(100))
+        .min(usize::MAX as u64) as usize
+}
+
 pub fn auto_compaction_threshold(
     config: &crate::config::configuration::CompactionConfig,
     context_window: Option<u32>,
@@ -289,9 +311,30 @@ pub fn select_messages_for_compaction_with_min(
 }
 
 pub fn build_prompt(messages: &[Message]) -> String {
+    build_prompt_within(messages, usize::MAX)
+}
+
+/// Build the summarization prompt, keeping it inside `max_tokens`.
+///
+/// `build_prompt` alone is unbounded: a long session serializes megabytes of
+/// transcript into a single request, which overruns the model context window
+/// and makes compaction fail instead of shrinking the session. Callers pass a
+/// budget derived from the active model's window.
+///
+/// When the transcript overruns the budget the scan keeps the newest sections
+/// that fit and skips the rest, and the elision is stated explicitly so the
+/// summary does not invent a beginning.
+pub fn build_prompt_within(messages: &[Message], max_tokens: usize) -> String {
     let mut prompt = String::new();
     prompt.push_str("Summarize the following session transcript.\n\n<session-transcript>\n");
 
+    // `estimate_tokens` assumes 4 chars/token, but real BPE tokenizers run
+    // higher on session transcripts — measured 1,200,614 real tokens against
+    // 892,015 estimated for the same 3.5M chars of transcript. Budgeting on
+    // the estimate alone overshoots the window and compaction fails again, so
+    // discount by the measured ratio and keep extra headroom.
+    let budget_chars = prompt_budget_chars(max_tokens);
+    let mut dropped = 0usize;
     for (idx, message) in messages.iter().enumerate() {
         if is_compaction_marker(message) {
             continue;
@@ -302,11 +345,29 @@ pub fn build_prompt(messages: &[Message]) -> String {
             continue;
         }
 
-        prompt.push_str(&format!(
+        let section = format!(
             "\n### Message {} ({})\n{}\n",
             idx + 1,
             role_label(message.role.clone()),
             content
+        );
+
+        // Reserve room for the closing instructions before deciding on a cut.
+        let reserved = SUMMARIZATION_PROMPT.len() + prompt.len() + 512;
+        if budget_chars.saturating_sub(reserved) < section.len() {
+            dropped += 1;
+            continue;
+        }
+
+        dropped = 0;
+        prompt.push_str(&section);
+    }
+
+    if dropped > 0 {
+        prompt.push_str(&format!(
+            "\n[Earlier messages omitted: {} message(s) exceeded the summarization \
+             request budget. Rely on the transcript below for current state.]\n",
+            dropped
         ));
     }
 
@@ -467,7 +528,13 @@ pub fn latest_compaction_stats(messages: &[Message]) -> Option<CompactionStats> 
 }
 
 pub fn is_compaction_summary(message: &Message) -> bool {
-    message.content.starts_with(SUMMARY_PREFIX)
+    is_compaction_summary_content(&message.content)
+}
+
+/// Content-only variant, for callers that hold raw restored text and have not
+/// built a [`Message`] yet.
+pub fn is_compaction_summary_content(content: &str) -> bool {
+    content.starts_with(SUMMARY_PREFIX)
 }
 
 pub fn is_compaction_marker(message: &Message) -> bool {
@@ -1205,6 +1272,91 @@ mod tests {
         assert!((restored_usage.cost - 0.42).abs() < f64::EPSILON);
         assert_eq!(total_context_tokens(&restored), before);
         assert!(message_context_tokens(restored_summary) < 80_000);
+    }
+
+    #[test]
+    fn billed_request_totals_are_not_restored_as_per_message_context() {
+        // `tokens_used` holds the whole request's billed buckets. Restoring it
+        // as `token_count` made every assistant message claim the entire
+        // context window, inflating the session ~300x on reload.
+        let mut assistant = Message::assistant("short reply");
+        assistant
+            .parts
+            .push(MessagePart::usage(1_500_000, 3_000, 10_000_000, 0, 0.0));
+        assistant.output_tokens = Some(3_000);
+
+        let persisted: crate::persistence::Message = assistant.into();
+        assert!(persisted.tokens_used > 1_000_000);
+
+        let restored = Message::try_from(persisted).expect("restore");
+        assert_eq!(
+            restored.token_count, None,
+            "billed request total must not become a per-message context count"
+        );
+        assert!(message_context_tokens(&restored) < 1_000);
+    }
+
+    #[test]
+    fn compaction_summary_still_restores_its_context_estimate() {
+        let mut summary = Message::user(format!("{}\nold summary", SUMMARY_PREFIX));
+        summary.token_count = Some(120);
+        summary
+            .parts
+            .push(MessagePart::usage(80_000, 400, 12_000, 1_000, 0.42));
+
+        let persisted: crate::persistence::Message = summary.into();
+        let restored = Message::try_from(persisted).expect("restore");
+
+        assert_eq!(restored.token_count, Some(120));
+    }
+
+    #[test]
+    fn compaction_prompt_is_capped_to_the_request_budget() {
+        let messages: Vec<Message> = (0..400).map(|_| Message::user("x".repeat(4_000))).collect();
+        let full = build_prompt(&messages);
+        let capped = build_prompt_within(&messages, 4_000);
+
+        assert!(full.len() > capped.len());
+        assert!(
+            capped.len() / 4 <= 4_000 + 2_000,
+            "capped prompt {} chars exceeds budget",
+            capped.len()
+        );
+        assert!(capped.contains("Earlier messages omitted"));
+        // The newest content must survive — that is the current state.
+        assert!(capped.contains(&"x".repeat(4_000)));
+    }
+
+    #[test]
+    fn compaction_prompt_within_generous_budget_keeps_everything() {
+        let messages = vec![Message::user("u1"), Message::assistant("a1")];
+        assert_eq!(
+            build_prompt_within(&messages, usize::MAX),
+            build_prompt(&messages)
+        );
+    }
+
+    #[test]
+    fn prompt_budget_corrects_for_real_tokenizer_overhead() {
+        // The 4-chars-per-token estimate undercounts real BPE tokens by ~35%
+        // on session transcripts, so the char budget must be discounted or the
+        // summarization request overruns the context window.
+        let tokens = 1_000_000usize;
+        let naive = tokens.saturating_mul(4);
+        let corrected = prompt_budget_chars(tokens);
+
+        assert!(
+            corrected < naive,
+            "corrected budget {corrected} must be below the naive {naive}"
+        );
+        // With the measured 1.35x ratio and 10% headroom the corrected budget
+        // should land near tokens * 4 / 1.35 * 0.9.
+        let expected = (naive as f64 / 1.35 * 0.9) as usize;
+        let drift = (corrected as f64 - expected as f64).abs() / expected as f64;
+        assert!(drift < 0.02, "budget {corrected} drifted from {expected}");
+
+        // And it must never exceed the naive budget for small inputs.
+        assert!(prompt_budget_chars(4_000) <= 4_000 * 4);
     }
 
     #[test]

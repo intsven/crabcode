@@ -1923,7 +1923,10 @@ impl AcpService {
         let before_tokens = crate::session::compaction::total_context_tokens(&messages);
         let before_messages =
             crate::session::compaction::filter_messages_for_context(&messages).len();
-        let prompt = crate::session::compaction::build_prompt(&selection.messages_to_summarize);
+        let prompt = crate::session::compaction::build_prompt_within(
+            &selection.messages_to_summarize,
+            compaction_prompt_budget(session.context_window),
+        );
         let summary = cancellable(
             &cancellation,
             crate::llm::client::summarize_for_compaction(
@@ -2335,6 +2338,23 @@ fn model_context_window(
                 .and_then(|provider| provider.models.get(model))
                 .and_then(|model| model.context_window)
         })
+}
+
+/// Token budget for a single compaction summarization request.
+///
+/// The transcript head is serialized into one request, so it must fit the
+/// model's window with room left for the summary itself.
+fn compaction_prompt_budget(context_window: Option<u32>) -> usize {
+    const FALLBACK: usize = 100_000;
+
+    context_window
+        .filter(|limit| *limit > 0)
+        .map(|limit| {
+            (limit as usize)
+                .saturating_sub(crate::session::compaction::DEFAULT_RESERVED_TOKENS as usize)
+        })
+        .filter(|budget| *budget > 0)
+        .unwrap_or(FALLBACK)
 }
 
 fn workspace_path(path: &Path) -> Result<PathBuf, Error> {

@@ -201,6 +201,9 @@ impl TryFrom<Message> for SessionMessage {
             .find(|p| p.part_type == "compaction_stats")
             .and_then(|p| serde_json::from_value::<CompactionStats>(p.data.clone()).ok());
 
+        let is_compaction_summary =
+            crate::session::compaction::is_compaction_summary_content(&content);
+
         let was_interrupted = session_parts.iter().any(|p| {
             p.part_type == "status"
                 && p.data
@@ -251,7 +254,15 @@ impl TryFrom<Message> for SessionMessage {
             timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(msg.timestamp as u64),
             is_complete: true,
             agent_mode: msg.agent_mode.clone(),
-            token_count: if msg.tokens_used > 0 {
+            // `tokens_used` is the billed total for the whole request
+            // (input + output + cache_read + cache_write), not this message's
+            // own context size. Restoring it as `token_count` makes every
+            // assistant message claim the entire context window, and summing
+            // that across the transcript inflates the session by orders of
+            // magnitude (it also breaks compaction thresholds). Only
+            // compaction summaries persist a real context estimate there — see
+            // the `is_compaction_summary` branch in `From<SessionMessage>`.
+            token_count: if is_compaction_summary && msg.tokens_used > 0 {
                 Some(msg.tokens_used as usize)
             } else {
                 None
