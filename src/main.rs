@@ -18,6 +18,7 @@ mod maintenance;
 mod mcp;
 mod model;
 mod notify;
+mod paste_burst;
 mod persistence;
 mod pr;
 mod prompt;
@@ -1840,6 +1841,10 @@ async fn run_event_loop(
     let mut jobs_refresh: Option<tokio::task::JoinHandle<()>> = None;
     let mut last_jobs_refresh = None::<std::time::Instant>;
     let mut displayed_jobs_count = app.process_registry.running_count();
+    // Events already read off the console while collecting an input burst. They
+    // are handled before waiting for new input, and never dropped.
+    let mut pending_events: std::collections::VecDeque<event::Event> =
+        std::collections::VecDeque::new();
 
     while app.running {
         let loop_start = std::time::Instant::now();
@@ -1894,9 +1899,13 @@ async fn run_event_loop(
         };
 
         let mut had_input = false;
-        if event::poll(poll_timeout)? {
+        let next_event = match pending_events.pop_front() {
+            Some(pending) => Some(pending),
+            None if event::poll(poll_timeout)? => Some(event::read()?),
+            None => None,
+        };
+        if let Some(event) = next_event {
             had_input = true;
-            let event = event::read()?;
 
             if std::env::var_os("CRABCODE_MOUSE_TRACE").is_some() {
                 if let event::Event::Mouse(mouse) = &event {
@@ -2013,9 +2022,33 @@ async fn run_event_loop(
                     needs_redraw = true;
                 }
                 event::Event::Key(key) => {
-                    app.handle_keys(key);
-                    if app.take_just_closed_overlay() {
-                        drain_pending_terminal_events(Duration::from_millis(12));
+                    // On Windows crossterm delivers a paste as one Char per
+                    // character, with embedded newlines arriving as real Enter
+                    // presses, so a multi-line paste would submit its first line
+                    // and then keep typing the rest. `collect` reassembles the
+                    // burst -- including the parts that arrive later, since a
+                    // big paste trickles in over several reads -- and a paste is
+                    // then inserted in one shot while typing is replayed as-is.
+                    let mut deferred = std::collections::VecDeque::new();
+                    let collected = paste_burst::collect(key, &mut deferred);
+                    // Anything that is not a key (mouse, resize, focus) goes back
+                    // to the front of the queue and is handled next iteration.
+                    while let Some(other) = deferred.pop_back() {
+                        pending_events.push_front(other);
+                    }
+
+                    match paste_burst::resolve(collected) {
+                        paste_burst::Burst::Paste(text) => {
+                            app.handle_paste(text);
+                        }
+                        paste_burst::Burst::Replay(keys) => {
+                            for replayed in keys {
+                                app.handle_keys(replayed);
+                                if app.take_just_closed_overlay() {
+                                    drain_pending_terminal_events(Duration::from_millis(12));
+                                }
+                            }
+                        }
                     }
                     needs_redraw = true;
                 }
