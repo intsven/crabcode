@@ -24,12 +24,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SOURCE: &str = "crabcode";
-const AGENT: &str = "crabcode";
-
-/// Command name used for the resume argv. Must be a bare name on the user's
-/// `PATH` (herdr rejects an absolute path with `invalid_resume_argv`) and must
-/// not carry an extension or a directory separator.
-const RESUME_COMMAND: &str = "crabcode";
+/// Fallback identity when the running executable cannot be named.
+const DEFAULT_AGENT: &str = "crabcode";
 
 /// herdr rejects resume argv that contains an apostrophe, a control character, or
 /// control characters/arguments past its limits.
@@ -66,6 +62,7 @@ enum Command {
 }
 
 static ENV: OnceLock<Option<HerdrEnv>> = OnceLock::new();
+static AGENT: OnceLock<String> = OnceLock::new();
 static REPORTER: OnceLock<Option<Reporter>> = OnceLock::new();
 /// Last state actually reported, paired with the session it described.
 static LAST_STATE: OnceLock<Mutex<Option<(&'static str, String)>>> = OnceLock::new();
@@ -100,6 +97,34 @@ fn env() -> Option<&'static HerdrEnv> {
 /// Whether crabcode is running inside a herdr pane.
 pub fn is_active() -> bool {
     env().is_some()
+}
+
+/// The name this build reports to herdr as, and the command herdr runs to
+/// resume a session: the running executable's file stem.
+///
+/// herdr replays `resume_argv` after a server restart, so a copy of the binary
+/// installed under another name (`crabc`) must be resumed by that name, not by
+/// whatever `crabcode` happens to resolve to on `PATH` -- that would silently
+/// hand the pane to a different install. Must be a bare command name with no
+/// extension or directory separator, or herdr answers `invalid_resume_argv`.
+fn agent() -> &'static str {
+    AGENT.get_or_init(|| {
+        let exe = std::env::current_exe().ok();
+        let stem = exe
+            .as_deref()
+            .and_then(std::path::Path::file_stem)
+            .and_then(std::ffi::OsStr::to_str)
+            .map(str::trim)
+            .filter(|name| {
+                !name.is_empty()
+                    && *name != "."
+                    && *name != ".."
+                    && !name.contains(['/', '\\', '\'', '\u{7f}'])
+                    && !name.chars().any(char::is_control)
+            })
+            .unwrap_or(DEFAULT_AGENT);
+        stem.to_string()
+    })
 }
 
 /// Map crabcode session status -> herdr agent state.
@@ -137,7 +162,7 @@ fn take_block_message() -> Option<String> {
 /// report but drop the resume command rather than fail the whole report.
 fn build_resume_argv(session_id: &str) -> Option<Vec<String>> {
     let argv = vec![
-        RESUME_COMMAND.to_string(),
+        agent().to_string(),
         "--session".to_string(),
         session_id.to_string(),
     ];
@@ -347,7 +372,7 @@ fn send_state(env: &HerdrEnv, state: &str, message: Option<&str>, session: Optio
     let mut params = serde_json::json!({
         "pane_id": env.pane_id,
         "source": SOURCE,
-        "agent": AGENT,
+        "agent": agent(),
         "state": state,
         "seq": seq,
     });
@@ -381,7 +406,7 @@ fn send_session(env: &HerdrEnv, info: &SessionInfo) {
             "params": {
                 "pane_id": env.pane_id,
                 "source": SOURCE,
-                "agent": AGENT,
+                "agent": agent(),
                 "seq": seq,
                 "agent_session_id": info.id,
                 "resume_argv": info.resume_argv,
@@ -400,7 +425,7 @@ fn send_release(env: &HerdrEnv) {
             "params": {
                 "pane_id": env.pane_id,
                 "source": SOURCE,
-                "agent": AGENT,
+                "agent": agent(),
                 "seq": seq,
             },
         }),
@@ -548,10 +573,26 @@ mod tests {
     #[test]
     fn resume_argv_is_bare_command_plus_session() {
         let argv = build_resume_argv("abc123").expect("resume argv");
-        assert_eq!(argv, vec!["crabcode", "--session", "abc123"]);
-        // herdr spawns argv[0] through a shell-free PATH lookup.
+        // herdr spawns argv[0] through a shell-free PATH lookup, and it must be
+        // the name this build was launched under, so a `crabc` copy is resumed
+        // with `crabc` rather than the `crabcode` that shadows it on PATH.
+        assert_eq!(argv[0], agent());
+        assert_eq!(&argv[1..], &["--session".to_string(), "abc123".to_string()]);
         assert!(!argv[0].contains('/'));
         assert!(!argv[0].contains('\\'));
+    }
+
+    #[test]
+    fn agent_name_is_a_bare_herdr_safe_command() {
+        // Whatever `current_exe` yields, herdr must accept it: non-empty, no
+        // extension, no separator, no quote or control character.
+        let name = agent();
+        assert!(!name.is_empty());
+        assert!(!name.contains('.'));
+        assert!(!name.contains('/'));
+        assert!(!name.contains('\\'));
+        assert!(!name.contains('\''));
+        assert!(!name.chars().any(char::is_control));
     }
 
     #[test]
