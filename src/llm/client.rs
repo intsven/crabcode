@@ -1303,6 +1303,12 @@ async fn prepare_request_config(
     has_audio_input: bool,
     sender: &crate::llm::ChunkSender,
 ) -> Result<ProviderRequestConfig, DynError> {
+    let (provider_name, model) = if model.starts_with("gemini-") && provider_name != "google" {
+        ("google".to_string(), model)
+    } else {
+        (provider_name.to_string(), model)
+    };
+    let provider_name = provider_name.as_str();
     let auth_dao = crate::persistence::AuthDAO::new()?;
     let auth_config = auth_dao.get_provider(provider_name)?;
 
@@ -2891,7 +2897,10 @@ enum ProviderKind {
 }
 
 impl ProviderKind {
-    fn from_provider(_provider_name: &str, npm_package: &str) -> Self {
+    fn from_provider(provider_name: &str, npm_package: &str) -> Self {
+        if provider_name.eq_ignore_ascii_case("google") || npm_package == "@ai-sdk/google" {
+            return Self::OpenAICompatible;
+        }
         match npm_package {
             "@ai-sdk/openai-compatible" | "@ai-sdk/gateway" | "@openrouter/ai-sdk-provider" => {
                 Self::OpenAICompatible
