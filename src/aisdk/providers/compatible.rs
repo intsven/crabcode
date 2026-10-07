@@ -202,6 +202,23 @@ impl Provider for OpenAICompatible {
                 format!("Bearer {}", self.api_key).parse().unwrap(),
             );
         }
+        // OpenRouter requires agentic harness identification headers
+        let is_openrouter = self.provider_name.eq_ignore_ascii_case("openrouter")
+            || self.base_url.contains("openrouter");
+        if is_openrouter {
+            request_headers.insert(
+                "HTTP-Referer",
+                "https://github.com".parse().unwrap(),
+            );
+            request_headers.insert(
+                "X-Title",
+                "Crabcode Custom Harness".parse().unwrap(),
+            );
+            request_headers.insert(
+                "X-OpenRouter-Title",
+                "Crabcode Custom Harness".parse().unwrap(),
+            );
+        }
         super::apply_extra_headers(&mut request_headers, &self.default_headers);
         super::apply_extra_headers(&mut request_headers, headers);
 
