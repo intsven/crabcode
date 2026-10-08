@@ -101,6 +101,52 @@ fn emit_build_stamp() {
     let stamp = env::var("CRABCODE_BUILD_DATE")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "2026-10-08T15:00Z".to_string());
+        .unwrap_or_else(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            epoch_to_utc_string(now)
+        });
     println!("cargo:rustc-env=CRABCODE_BUILD_STAMP={stamp}");
+}
+
+fn epoch_to_utc_string(secs: u64) -> String {
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    let hours = rem / 3600;
+    let minutes = (rem % 3600) / 60;
+    let (year, month, day) = days_to_ymd(days);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}Z", year, month, day, hours, minutes)
+}
+
+fn days_to_ymd(mut days: u64) -> (u32, u32, u32) {
+    let mut year = 1970;
+    loop {
+        let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        let year_days = if leap { 366 } else { 365 };
+        if days >= year_days {
+            days -= year_days;
+            year += 1;
+        } else {
+            break;
+        }
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let months = if leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month = 1;
+    for &m_days in &months {
+        if days >= m_days {
+            days -= m_days;
+            month += 1;
+        } else {
+            break;
+        }
+    }
+    let day = days + 1;
+    (year as u32, month, day as u32)
 }
