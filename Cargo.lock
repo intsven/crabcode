@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "crabcode"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
