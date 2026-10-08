@@ -79,7 +79,7 @@ pub struct Input {
     draft_state: Option<DraftState>,
     local_images: Vec<LocalImageAttachment>,
     pending_pastes: Vec<PendingPaste>,
-    image_open_config: crate::config::ImagesConfig,
+    pending_file_action: Option<PathBuf>,
     hovered_image_placeholder: Option<String>,
     hovered_paste_placeholder: Option<String>,
 }
@@ -134,7 +134,7 @@ impl Input {
             draft_state: None,
             local_images: Vec::new(),
             pending_pastes: Vec::new(),
-            image_open_config: crate::config::ImagesConfig::default(),
+            pending_file_action: None,
             hovered_image_placeholder: None,
             hovered_paste_placeholder: None,
         }
@@ -349,8 +349,8 @@ impl Input {
         self
     }
 
-    pub fn set_image_open_config(&mut self, config: crate::config::ImagesConfig) {
-        self.image_open_config = config;
+    pub fn take_file_action(&mut self) -> Option<PathBuf> {
+        self.pending_file_action.take()
     }
 
     pub fn contains_mouse(&self, mouse: MouseEvent) -> bool {
@@ -993,18 +993,7 @@ impl Input {
                 {
                     let offset = self.flat_offset_for_position(target_row, target_col);
                     if let Some(image) = self.image_at_offset(offset) {
-                        match image_attachment::open_path(&image.path, &self.image_open_config) {
-                            Ok(()) => push_toast(Toast::new(
-                                format!("Opened {}", image.placeholder),
-                                ToastLevel::Info,
-                                None,
-                            )),
-                            Err(err) => push_toast(Toast::new(
-                                format!("Failed to open image: {}", err),
-                                ToastLevel::Error,
-                                None,
-                            )),
-                        }
+                        self.pending_file_action = Some(image.path.clone());
                         return true;
                     }
                     if let Some((range, paste)) = self.paste_at_offset(offset) {
@@ -3353,6 +3342,44 @@ mod tests {
         assert!(input.has_active_selection_edge_scroll());
         assert_eq!(input.textarea.cursor(), (0, 14));
         assert_eq!(input.get_selected_text(), "0123456789ABCD");
+    }
+
+    #[test]
+    fn image_click_requests_file_actions_without_opening() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("screenshot.png");
+        std::fs::write(&path, [0, 255]).unwrap();
+        let mut input = Input::new();
+        input.attach_image(path.clone());
+
+        let colors = test_colors();
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|frame| {
+                input.render(
+                    frame,
+                    Rect::new(0, 0, 60, 8),
+                    "Plan",
+                    "model",
+                    "provider",
+                    None,
+                    false,
+                    &colors,
+                    true,
+                );
+            })
+            .unwrap();
+        let (x, y) = find_buffer_text(terminal.backend().buffer(), 60, 8, "[Image #1]")
+            .expect("image placeholder rendered");
+        assert!(input.handle_mouse_event(mouse_event_at(
+            MouseEventKind::Down(MouseButton::Left),
+            x,
+            y,
+        )));
+        assert_eq!(input.take_file_action(), Some(path));
+        assert_eq!(input.take_file_action(), None);
     }
 
     #[test]

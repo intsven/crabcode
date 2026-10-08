@@ -10,7 +10,6 @@ mod command;
 mod completion;
 mod config;
 mod herdr;
-mod import;
 mod jobs;
 mod llm;
 mod logging;
@@ -18,7 +17,6 @@ mod maintenance;
 mod mcp;
 mod model;
 mod notify;
-mod paste_burst;
 mod persistence;
 mod pr;
 mod prompt;
@@ -136,53 +134,32 @@ fn mouse_scroll_kind(kind: MouseEventKind) -> bool {
     matches!(kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp)
 }
 
-fn keyboard_enhancement_requested() -> bool {
-    if std::env::var_os("CRABCODE_DISABLE_KEYBOARD_ENHANCEMENT").is_some() {
-        return false;
-    }
-
-    // crossterm's Windows event source decodes WinAPI `KEY_EVENT_RECORD`s and has no
-    // parser for the kitty keyboard protocol, and it hard-refuses to even emit the
-    // push sequence there (`is_ansi_code_supported() == false`,
-    // `execute_winapi()` -> `ErrorKind::Unsupported`). Asking for it on Windows always
-    // fails, so never request it: startup must not depend on it.
-    !cfg!(windows)
-}
-
-/// Enters the TUI modes and reports whether keyboard enhancement is actually active.
-///
-/// A rejected push degrades to plain key events instead of aborting startup, and the
-/// caller learns about it so the matching pop is only sent when a push succeeded.
 fn apply_terminal_enter_modes<W: std::io::Write>(
     writer: &mut W,
     keyboard_enhancement: bool,
-) -> Result<bool> {
-    execute!(
-        writer,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableFocusChange,
-        EnableBracketedPaste
-    )?;
-
-    if !keyboard_enhancement {
-        return Ok(false);
+) -> Result<()> {
+    if keyboard_enhancement {
+        execute!(
+            writer,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableFocusChange,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+            ),
+            EnableBracketedPaste
+        )?;
+    } else {
+        execute!(
+            writer,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableFocusChange,
+            EnableBracketedPaste
+        )?;
     }
-
-    let pushed = execute!(
-        writer,
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
-        ),
-    )
-    .is_ok();
-
-    if !pushed {
-        push_startup_diag("keyboard enhancement unavailable; using plain key events".to_string());
-    }
-
-    Ok(pushed)
+    Ok(())
 }
 
 fn restore_terminal_modes(
@@ -192,13 +169,11 @@ fn restore_terminal_modes(
     drain_pending_terminal_events(Duration::from_millis(0));
 
     let restore_result = if keyboard_enhancement {
-        // Best-effort: the pop is only meaningful when a push succeeded, and a failure
-        // here must not turn a clean exit into a crash report.
-        let _ = execute!(backend, PopKeyboardEnhancementFlags);
         execute!(
             backend,
             DisableMouseCapture,
             DisableFocusChange,
+            PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
             LeaveAlternateScreen
         )
@@ -236,15 +211,14 @@ fn run_shell_command_blocking(command: &str) -> io::Result<std::process::ExitSta
 
 fn suspend_and_run_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    keyboard_enhancement: &mut bool,
+    keyboard_enhancement: bool,
     command: &str,
 ) -> Result<()> {
-    restore_terminal_modes(terminal.backend_mut(), *keyboard_enhancement)?;
+    restore_terminal_modes(terminal.backend_mut(), keyboard_enhancement)?;
     let _ = terminal.show_cursor();
     let status = run_shell_command_blocking(command);
     enable_raw_mode()?;
-    *keyboard_enhancement =
-        apply_terminal_enter_modes(terminal.backend_mut(), *keyboard_enhancement)?;
+    apply_terminal_enter_modes(terminal.backend_mut(), keyboard_enhancement)?;
     let _ = terminal.hide_cursor();
     let _ = terminal.clear();
     drain_pending_terminal_events(Duration::from_millis(0));
@@ -807,8 +781,8 @@ pub(crate) struct Args {
     #[arg(long = "reasoning-effort", value_parser = parse_reasoning_effort_arg)]
     reasoning_effort: Option<crate::model::reasoning::ReasoningEffort>,
 
-    /// Skip permission prompts in print mode. Intended for isolated benchmark/CI workspaces.
-    #[arg(long = "dangerously-skip-permissions")]
+    /// Skip permission prompts in local interactive/print mode (dangerous). Explicit denies still apply.
+    #[arg(long = "dangerously-skip-permissions", visible_alias = "yolo")]
     dangerously_skip_permissions: bool,
 
     #[arg(long = "emit-logs", hide = true)]
@@ -910,24 +884,6 @@ enum Command {
     Maintenance {
         #[command(subcommand)]
         command: MaintenanceCommand,
-    },
-
-    /// Import an opencode session transcript (`opencode export` JSON) into history
-    Import {
-        /// Path to the export JSON, or `-` to read stdin
-        source: String,
-
-        /// Import into this workspace root instead of the session's own directory
-        #[arg(long, value_name = "PATH")]
-        workspace: Option<String>,
-
-        /// Report what would be imported without writing anything
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Replace an existing session with the same identifier
-        #[arg(long)]
-        force: bool,
     },
 
     /// Manage MCP servers (list / auth / logout)
@@ -1216,19 +1172,6 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
-        Some(Command::Import {
-            source,
-            workspace,
-            dry_run,
-            force,
-        }) => {
-            return crate::import::run(crate::import::ImportOptions {
-                source: source.clone(),
-                workspace: workspace.clone(),
-                dry_run: *dry_run,
-                force: *force,
-            });
-        }
         Some(Command::Mcp { command }) => {
             let cli = match command {
                 McpCommand::List => crate::mcp::cli::McpCliCommand::List,
@@ -1284,7 +1227,14 @@ async fn main() -> Result<()> {
         .await;
     }
 
-    let mut app = App::new_with_model_override(args.model.as_deref(), args.agent.as_deref())?;
+    let mut app = App::new_with_runtime_options(
+        args.model.as_deref(),
+        args.agent.as_deref(),
+        crate::config::ConfigRuntimeOptions {
+            dangerously_skip_permissions: args.dangerously_skip_permissions,
+            ..Default::default()
+        },
+    )?;
     // Keep herdr authority until this guard drops (normal exit or panic).
     let _herdr = crate::herdr::Session::start();
 
@@ -1312,9 +1262,9 @@ async fn main() -> Result<()> {
     let mut stdout = io::stdout();
 
     // Skip blocking supports_keyboard_enhancement() CSI probe (Codex pattern).
-    // Push flags where they can work; opt out via env.
-    let mut keyboard_enhancement = keyboard_enhancement_requested();
-    keyboard_enhancement = apply_terminal_enter_modes(&mut stdout, keyboard_enhancement)?;
+    // Always push flags; terminals that ignore them are fine. Opt out via env.
+    let keyboard_enhancement = std::env::var_os("CRABCODE_DISABLE_KEYBOARD_ENHANCEMENT").is_none();
+    apply_terminal_enter_modes(&mut stdout, keyboard_enhancement)?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -1325,7 +1275,7 @@ async fn main() -> Result<()> {
         &mut app,
         session_history_loaded,
         startup_hydrated,
-        &mut keyboard_enhancement,
+        keyboard_enhancement,
     )
     .await;
     let remote_launch_request = app.take_remote_launch_request();
@@ -1371,23 +1321,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn terminal_enter_modes_never_fail_on_unsupported_keyboard_enhancement() {
-        let requested = keyboard_enhancement_requested();
-
-        let mut sink: Vec<u8> = Vec::new();
-        let pushed =
-            apply_terminal_enter_modes(&mut sink, true).expect("enter modes must not fail");
-
-        // crossterm refuses the kitty protocol on Windows, so enhancement must be
-        // reported as inactive there instead of aborting startup.
-        assert_eq!(pushed, requested && !cfg!(windows));
-
-        let mut sink: Vec<u8> = Vec::new();
-        assert!(!apply_terminal_enter_modes(&mut sink, false).expect("enter modes must not fail"));
+    fn permission_bypass_is_opt_in() {
         assert!(
-            String::from_utf8_lossy(&sink).contains("\u{1b}[?1049h"),
-            "alternate screen must still be entered without enhancement"
+            !Args::try_parse_from(["crabcode"])
+                .unwrap()
+                .dangerously_skip_permissions
         );
+        assert!(
+            !Args::try_parse_from(["crabcode", "-p", "hi"])
+                .unwrap()
+                .dangerously_skip_permissions
+        );
+    }
+
+    #[test]
+    fn parses_permission_bypass_in_interactive_and_print_modes() {
+        for flag in ["--dangerously-skip-permissions", "--yolo"] {
+            let args = Args::try_parse_from(["crabcode", flag]).unwrap();
+            assert!(args.dangerously_skip_permissions);
+            assert!(!args.print_mode);
+
+            let args = Args::try_parse_from(["crabcode", "-p", "hi", flag]).unwrap();
+            assert!(args.dangerously_skip_permissions);
+            assert!(args.print_mode);
+            assert_eq!(args.prompt, vec!["hi"]);
+        }
+    }
+
+    #[test]
+    fn help_documents_permission_bypass_and_alias() {
+        let help = root_help().unwrap();
+        assert!(help.contains("--dangerously-skip-permissions"));
+        assert!(help.contains("yolo"));
+        assert!(help.contains("Explicit denies still apply"));
     }
 
     #[test]
@@ -1821,7 +1787,7 @@ async fn run_event_loop(
     app: &mut App,
     mut session_history_loaded: bool,
     mut startup_hydrated: bool,
-    keyboard_enhancement: &mut bool,
+    keyboard_enhancement: bool,
 ) -> Result<()> {
     // Adaptive poll: fast for home blink / streaming, park nearly forever when idle.
     // A short "idle" poll still burns needless redraws/sec; block until input instead.
@@ -1841,10 +1807,6 @@ async fn run_event_loop(
     let mut jobs_refresh: Option<tokio::task::JoinHandle<()>> = None;
     let mut last_jobs_refresh = None::<std::time::Instant>;
     let mut displayed_jobs_count = app.process_registry.running_count();
-    // Events already read off the console while collecting an input burst. They
-    // are handled before waiting for new input, and never dropped.
-    let mut pending_events: std::collections::VecDeque<event::Event> =
-        std::collections::VecDeque::new();
 
     while app.running {
         let loop_start = std::time::Instant::now();
@@ -1899,13 +1861,9 @@ async fn run_event_loop(
         };
 
         let mut had_input = false;
-        let next_event = match pending_events.pop_front() {
-            Some(pending) => Some(pending),
-            None if event::poll(poll_timeout)? => Some(event::read()?),
-            None => None,
-        };
-        if let Some(event) = next_event {
+        if event::poll(poll_timeout)? {
             had_input = true;
+            let event = event::read()?;
 
             if std::env::var_os("CRABCODE_MOUSE_TRACE").is_some() {
                 if let event::Event::Mouse(mouse) = &event {
@@ -2022,33 +1980,9 @@ async fn run_event_loop(
                     needs_redraw = true;
                 }
                 event::Event::Key(key) => {
-                    // On Windows crossterm delivers a paste as one Char per
-                    // character, with embedded newlines arriving as real Enter
-                    // presses, so a multi-line paste would submit its first line
-                    // and then keep typing the rest. `collect` reassembles the
-                    // burst -- including the parts that arrive later, since a
-                    // big paste trickles in over several reads -- and a paste is
-                    // then inserted in one shot while typing is replayed as-is.
-                    let mut deferred = std::collections::VecDeque::new();
-                    let collected = paste_burst::collect(key, &mut deferred);
-                    // Anything that is not a key (mouse, resize, focus) goes back
-                    // to the front of the queue and is handled next iteration.
-                    while let Some(other) = deferred.pop_back() {
-                        pending_events.push_front(other);
-                    }
-
-                    match paste_burst::resolve(collected) {
-                        paste_burst::Burst::Paste(text) => {
-                            app.handle_paste(text);
-                        }
-                        paste_burst::Burst::Replay(keys) => {
-                            for replayed in keys {
-                                app.handle_keys(replayed);
-                                if app.take_just_closed_overlay() {
-                                    drain_pending_terminal_events(Duration::from_millis(12));
-                                }
-                            }
-                        }
+                    app.handle_keys(key);
+                    if app.take_just_closed_overlay() {
+                        drain_pending_terminal_events(Duration::from_millis(12));
                     }
                     needs_redraw = true;
                 }

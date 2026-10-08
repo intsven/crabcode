@@ -68,7 +68,6 @@ pub fn handle_sessions<'a>(
                 } else {
                     session.title.clone()
                 };
-
                 crate::command::registry::DialogItem {
                     id: session.id.clone(),
                     name,
@@ -399,6 +398,10 @@ pub async fn load_models(parsed: ParsedCommand) -> CommandResult {
         };
 
         if let Ok(discovery) = discovery.as_ref() {
+            crate::model::discovery::merge_dialog_models(
+                &mut models,
+                discovery.discover_custom_models_for_dialog().await,
+            );
             discovery.apply_custom_models_to_dialog(&mut models);
         }
 
@@ -815,7 +818,9 @@ fn skill_command_result(
 
 pub fn register_skill_commands(registry: &mut Registry) {
     if let Some(store) = crate::skill::get_skill_store() {
-        for skill in store.all() {
+        // Register installed names so enabling a skill does not need a restart.
+        // The handler enforces current availability; these entries are hidden.
+        for skill in store.installed() {
             if registry.has_public_command(&skill.name) {
                 continue;
             }
@@ -880,7 +885,6 @@ pub async fn refresh_models() -> CommandResult {
                 return CommandResult::Success(String::new());
             }
         };
-
         let (providers_result, runtime_result) = tokio::join!(
             discovery.refresh_cache(),
             crate::model::extensions::ModelExtensions::refresh_runtime_models()
@@ -1137,7 +1141,7 @@ pub fn register_all_commands(registry: &mut Registry) {
 
     registry.register(Command {
         name: "skills".to_string(),
-        description: "List available skills".to_string(),
+        description: "View and toggle installed skills".to_string(),
         handler: handle_skills,
         hidden_tokens: vec![],
         chat_only: false,
@@ -1200,6 +1204,21 @@ mod tests {
             skill_command_result(&parsed, None),
             CommandResult::Error("Unknown command: test-skill-prompt".to_string())
         );
+        let prefs = crate::persistence::PrefsDAO::in_memory();
+        store
+            .set_enabled("test-skill-prompt", false, &prefs)
+            .unwrap();
+        assert_eq!(
+            skill_command_result(&parsed, Some(&store)),
+            CommandResult::Error("Unknown command: test-skill-prompt".to_string())
+        );
+        store
+            .set_enabled("test-skill-prompt", true, &prefs)
+            .unwrap();
+        assert!(matches!(
+            skill_command_result(&parsed, Some(&store)),
+            CommandResult::RunPrompt { .. }
+        ));
     }
 
     #[tokio::test]
