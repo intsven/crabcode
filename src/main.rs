@@ -813,6 +813,12 @@ pub(crate) struct Args {
     #[arg(long = "test-notification", hide = true)]
     test_notification: bool,
 
+    #[arg(long = "test-paste-harness", hide = true)]
+    test_paste_harness: Option<String>,
+
+    #[arg(long = "test-paste-base64", hide = true)]
+    test_paste_base64: Option<String>,
+
     /// The prompt to run (positional, used in print mode)
     prompt: Vec<String>,
 }
@@ -1257,6 +1263,37 @@ async fn main() -> Result<()> {
             ..Default::default()
         },
     )?;
+
+    if let Some(ref text) = args.test_paste_harness {
+        app.handle_paste(text.clone());
+        let input_text = app.input.get_text();
+        let expected = text.replace("\r\n", "\n").replace('\r', "\n");
+        if input_text == expected {
+            println!("TEST_PASTE_SUCCESS: {}", input_text.replace('\n', "\\n"));
+            std::process::exit(0);
+        } else {
+            eprintln!("TEST_PASTE_FAILURE: expected {:?}, got {:?}", expected, input_text);
+            std::process::exit(1);
+        }
+    }
+
+    if let Some(ref b64) = args.test_paste_base64 {
+        use base64::Engine as _;
+        let decoded_bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("failed to decode base64 paste");
+        let text = String::from_utf8(decoded_bytes).expect("invalid utf8 paste");
+        app.handle_paste(text.clone());
+        let input_text = app.input.get_text();
+        let expected = text.replace("\r\n", "\n").replace('\r', "\n");
+        if input_text == expected {
+            println!("TEST_PASTE_SUCCESS: {}", input_text.replace('\n', "\\n"));
+            std::process::exit(0);
+        } else {
+            eprintln!("TEST_PASTE_FAILURE: expected {:?}, got {:?}", expected, input_text);
+            std::process::exit(1);
+        }
+    }
     // Keep herdr authority until this guard drops (normal exit or panic).
     let _herdr = crate::herdr::Session::start();
 
