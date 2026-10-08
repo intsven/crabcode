@@ -109,6 +109,11 @@ pub fn is_active() -> bool {
 /// extension or directory separator, or herdr answers `invalid_resume_argv`.
 fn agent() -> &'static str {
     AGENT.get_or_init(|| {
+        if let Ok(custom) = std::env::var("CRABCODE_HERDR_AGENT") {
+            if !custom.is_empty() {
+                return custom;
+            }
+        }
         let exe = std::env::current_exe().ok();
         let stem = exe
             .as_deref()
@@ -123,6 +128,11 @@ fn agent() -> &'static str {
                     && !name.chars().any(char::is_control)
             })
             .unwrap_or(DEFAULT_AGENT);
+
+        if stem.starts_with("crabcode-") && stem.len() > 9 && stem[9..].chars().all(|c| c.is_ascii_digit() || c == '-') {
+            return "crabnew".to_string();
+        }
+
         stem.to_string()
     })
 }
