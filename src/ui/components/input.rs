@@ -3817,4 +3817,12 @@ mod tests {
         assert!(input.handle_event(modified_key_event(KeyCode::Backspace, KeyModifiers::ALT,)));
         assert_eq!(input.get_text(), "hello ");
     }
+
+    #[test]
+    fn test_multiline_paste_inserts_as_single_block() {
+        let mut input = Input::new();
+        let multiline = "Line 1 of paste\nLine 2 of paste";
+        input.insert_paste(multiline);
+        assert_eq!(input.get_text(), multiline);
+    }
 }
