@@ -208,15 +208,15 @@ impl Provider for OpenAICompatible {
         if is_openrouter {
             request_headers.insert(
                 "HTTP-Referer",
-                "https://github.com".parse().unwrap(),
+                "https://opencode.ai".parse().unwrap(),
             );
             request_headers.insert(
                 "X-Title",
-                "Crabcode Custom Harness".parse().unwrap(),
+                "OpenCode".parse().unwrap(),
             );
             request_headers.insert(
                 "X-OpenRouter-Title",
-                "Crabcode Custom Harness".parse().unwrap(),
+                "OpenCode".parse().unwrap(),
             );
         }
         super::apply_extra_headers(&mut request_headers, &self.default_headers);

@@ -18,6 +18,7 @@ mod mcp;
 mod model;
 mod notify;
 mod persistence;
+mod paste_burst;
 mod pr;
 mod prompt;
 mod remote;
@@ -139,7 +140,7 @@ fn apply_terminal_enter_modes<W: std::io::Write>(
     keyboard_enhancement: bool,
 ) -> Result<()> {
     if keyboard_enhancement {
-        execute!(
+        let res = execute!(
             writer,
             EnterAlternateScreen,
             EnableMouseCapture,
@@ -149,7 +150,16 @@ fn apply_terminal_enter_modes<W: std::io::Write>(
                     | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
             ),
             EnableBracketedPaste
-        )?;
+        );
+        if res.is_err() {
+            execute!(
+                writer,
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableFocusChange,
+                EnableBracketedPaste
+            )?;
+        }
     } else {
         execute!(
             writer,
@@ -169,14 +179,25 @@ fn restore_terminal_modes(
     drain_pending_terminal_events(Duration::from_millis(0));
 
     let restore_result = if keyboard_enhancement {
-        execute!(
+        let res = execute!(
             backend,
             DisableMouseCapture,
             DisableFocusChange,
             PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
             LeaveAlternateScreen
-        )
+        );
+        if res.is_err() {
+            execute!(
+                backend,
+                DisableMouseCapture,
+                DisableFocusChange,
+                DisableBracketedPaste,
+                LeaveAlternateScreen
+            )
+        } else {
+            res
+        }
     } else {
         execute!(
             backend,
@@ -1980,7 +2001,25 @@ async fn run_event_loop(
                     needs_redraw = true;
                 }
                 event::Event::Key(key) => {
-                    app.handle_keys(key);
+                    if paste_burst::is_paste_text_key(&key) {
+                        let mut deferred = std::collections::VecDeque::new();
+                        let collected = paste_burst::collect(key, &mut deferred);
+                        match paste_burst::resolve(collected) {
+                            paste_burst::Burst::Paste(text) => {
+                                app.handle_paste(text);
+                            }
+                            paste_burst::Burst::Replay(keys) => {
+                                for k in keys {
+                                    app.handle_keys(k);
+                                }
+                            }
+                        }
+                        while let Some(ev) = deferred.pop_front() {
+                            handle_terminal_event(app, ev);
+                        }
+                    } else {
+                        app.handle_keys(key);
+                    }
                     if app.take_just_closed_overlay() {
                         drain_pending_terminal_events(Duration::from_millis(12));
                     }

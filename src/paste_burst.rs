@@ -114,8 +114,8 @@ pub(crate) fn collect(first: KeyEvent, deferred: &mut VecDeque<Event>) -> Collec
     let mut keys = vec![first];
     let mut max_gap = Duration::ZERO;
 
-    // Zero-timeout probe first: a lone keystroke must not wait out the window.
-    if !matches!(event::poll(Duration::ZERO), Ok(true)) {
+    // Small probe window to catch chunked terminal pastes on Windows.
+    if !matches!(event::poll(Duration::from_millis(15)), Ok(true)) {
         return Collected { keys, max_gap };
     }
 
