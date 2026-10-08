@@ -166,9 +166,6 @@ pub(crate) fn resolve(collected: Collected) -> Burst {
     if keys.len() < MIN_PASTE_KEYS {
         return Burst::Replay(keys);
     }
-    if max_gap > QUIET_WINDOW {
-        return Burst::Replay(keys);
-    }
     if !keys.iter().all(is_paste_text_key) {
         return Burst::Replay(keys);
     }
@@ -182,7 +179,12 @@ pub(crate) fn resolve(collected: Collected) -> Burst {
             }
         }
     }
-    Burst::Paste(text)
+
+    if text.contains('\n') || max_gap <= QUIET_WINDOW {
+        return Burst::Paste(text);
+    }
+
+    Burst::Replay(keys)
 }
 
 #[cfg(test)]
@@ -258,6 +260,21 @@ mod tests {
             Duration::from_millis(35),
         ));
         assert_eq!(burst, Burst::Paste("hi\nyo".to_string()));
+    }
+
+    #[test]
+    fn multiline_paste_with_large_gap_is_still_paste() {
+        let burst = resolve(collected(
+            vec![
+                key(KeyCode::Char('l')),
+                key(KeyCode::Char('1')),
+                key(KeyCode::Enter),
+                key(KeyCode::Char('l')),
+                key(KeyCode::Char('2')),
+            ],
+            Duration::from_millis(1500),
+        ));
+        assert_eq!(burst, Burst::Paste("l1\nl2".to_string()));
     }
 
     #[test]
