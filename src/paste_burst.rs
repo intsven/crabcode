@@ -35,11 +35,11 @@ use std::time::{Duration, Instant};
 /// when typing quickly, while every gap within a paste is far smaller. A burst
 /// is collected while keys keep arriving sooner than this, so a paste that
 /// trickles in over a slow link is still reassembled correctly.
-pub(crate) const QUIET_WINDOW: Duration = Duration::from_millis(150);
+pub(crate) const QUIET_WINDOW: Duration = Duration::from_millis(200);
 
 /// Hard cap on how long a single burst may keep absorbing keys, so a held-down
 /// key or a spamming console cannot extend the burst indefinitely.
-pub(crate) const MAX_BURST_SPAN: Duration = Duration::from_millis(2000);
+pub(crate) const MAX_BURST_SPAN: Duration = Duration::from_millis(3000);
 
 /// Hard cap on how many events one burst may collect, so a stuck or spamming
 /// console cannot grow the buffer without limit.
@@ -269,7 +269,7 @@ mod tests {
                 key(KeyCode::Char('!')),
                 key(KeyCode::Char(' ')),
             ],
-            Duration::from_millis(300),
+            Duration::from_millis(350),
         ));
         match burst {
             Burst::Replay(keys) => assert_eq!(keys.len(), 4),
