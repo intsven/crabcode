@@ -319,4 +319,26 @@ mod tests {
             other => panic!("expected paste, got {other:?}"),
         }
     }
+
+    #[test]
+    fn multiline_paste_test_harness() {
+        let line1 = "This is the first line of a multiline paste test into crabcode, if you only see this line the multiline paste functionality is broken, wait for second line to continue.";
+        let line2 = "Second line: Does it paste as one block instantly now without starting the agent loop by the new lines contained in this paste.";
+        
+        let mut keys = Vec::new();
+        for c in line1.chars() {
+            keys.push(key(KeyCode::Char(c)));
+        }
+        keys.push(key(KeyCode::Enter));
+        for c in line2.chars() {
+            keys.push(key(KeyCode::Char(c)));
+        }
+
+        let burst = resolve(tight(keys));
+        let expected = format!("{}\n{}", line1, line2);
+        match burst {
+            Burst::Paste(text) => assert_eq!(text, expected),
+            other => panic!("expected Burst::Paste, got {other:?}"),
+        }
+    }
 }
