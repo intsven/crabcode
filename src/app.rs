@@ -19345,4 +19345,23 @@ mod tests {
         );
         assert_eq!(subagent_tab_label("", "fallback"), "fallback");
     }
+
+    #[test]
+    fn test_ratatui_test_backend_multiline_paste() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = test_app();
+        let multiline_text = "This is the first line of a multiline paste test into crabcode, if you only see this line the multiline paste functionality is broken, wait for second line to continue.\nSecond line: Does it paste as one block instantly now without starting the agent loop by the new lines contained in this paste?";
+
+        app.handle_paste(multiline_text.to_string());
+
+        assert_eq!(app.input.get_text(), multiline_text);
+        assert!(app.running);
+
+        terminal.draw(|_| {}).unwrap();
+    }
 }
