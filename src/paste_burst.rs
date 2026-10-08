@@ -115,9 +115,9 @@ pub(crate) fn collect(first: KeyEvent, deferred: &mut VecDeque<Event>) -> Collec
     let mut max_gap = Duration::ZERO;
     let mut last_arrival = Instant::now();
 
-    // Immediately drain all pending key events currently in the input queue (atomic batch drain).
+    // Drain all pending key events, waiting up to 50ms for chunked paste delivery.
     while keys.len() < MAX_BURST_KEYS {
-        match event::poll(Duration::ZERO) {
+        match event::poll(Duration::from_millis(50)) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) if is_paste_text_key(&key) => {
                     let now = Instant::now();
