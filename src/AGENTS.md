@@ -1,7 +1,22 @@
 # Local Agent Instructions
 
-Scope: this workspace root. Rules here apply only when the working directory is
-`D:\Programming\CrabCodeRoot` or a subdirectory that has no nearer `AGENTS.md`.
+**Mirrored into the repo** at `crabcode\src\AGENTS.md`, which is a plain copy of
+this file — it cannot be a symlink, since this token has no
+`SeCreateSymbolicLinkPrivilege` and git would record the link target as file
+content. Nothing enforces the sync, so after editing this file you must
+re-copy it, or the two will silently diverge:
+
+```powershell
+Copy-Item 'D:\Programming\CrabCodeRoot\AGENTS.md' 'D:\Programming\CrabCodeRoot\crabcode\src\AGENTS.md' -Force
+```
+
+`t\publish_build.ps1` compares both hashes on every publish and warns when they
+differ. Because the mirror sits at `src\`, it is the *nearer* `AGENTS.md` for
+everything under `src/` and so takes precedence there; keeping the two
+byte-identical is what makes that harmless.
+
+Scope of the rules below: this workspace. They apply when the working directory
+is `D:\Programming\CrabCodeRoot` or a subdirectory with no nearer `AGENTS.md`.
 
 ## Running crabcode: prefer `crabnew`, else `crabc`
 
