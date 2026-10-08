@@ -109,6 +109,23 @@ fn emit_build_stamp() {
             epoch_to_utc_string(now)
         });
     println!("cargo:rustc-env=CRABCODE_BUILD_STAMP={stamp}");
+
+    // Publish scripts snapshot the exe under a name derived from this stamp, so
+    // the filename and `crabcode --version` can never disagree. The env var is
+    // read before the build starts while the snapshot is written after it
+    // finishes, so they would otherwise drift by the build duration.
+    if let Ok(profile_dir) = std::env::var("OUT_DIR") {
+        let mut path = PathBuf::from(profile_dir);
+        // OUT_DIR is target/<profile>/build/<pkg>-<hash>/out; walk up to
+        // target/<profile>.
+        for _ in 0..3 {
+            if !path.pop() {
+                break;
+            }
+        }
+        path.push("build-stamp.txt");
+        let _ = fs::write(path, &stamp);
+    }
 }
 
 fn epoch_to_utc_string(secs: u64) -> String {
