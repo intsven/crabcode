@@ -2042,11 +2042,28 @@ async fn run_event_loop(
                     if paste_burst::is_paste_text_key(&key) {
                         let mut deferred = std::collections::VecDeque::new();
                         let collected = paste_burst::collect(key, &mut deferred);
+                        crate::emit_log!(
+                            "[PASTE] burst collected keys={} max_gap_ms={} deferred={}",
+                            collected.keys.len(),
+                            collected.max_gap.as_millis(),
+                            deferred.len()
+                        );
                         match paste_burst::resolve(collected) {
                             paste_burst::Burst::Paste(text) => {
+                                crate::emit_log!(
+                                    "[PASTE] resolved PASTE chars={} newlines={} preview={:?}",
+                                    text.chars().count(),
+                                    text.matches('\n').count(),
+                                    text.chars().take(40).collect::<String>()
+                                );
                                 app.handle_paste(text);
                             }
                             paste_burst::Burst::Replay(keys) => {
+                                crate::emit_log!(
+                                    "[PASTE] resolved REPLAY keys={} first={:?}",
+                                    keys.len(),
+                                    keys.first().map(|k| k.code)
+                                );
                                 for k in keys {
                                     app.handle_keys(k);
                                 }
@@ -2056,6 +2073,7 @@ async fn run_event_loop(
                             handle_terminal_event(app, ev);
                         }
                     } else {
+                        crate::emit_log!("[PASTE] non-text key passthrough code={:?}", key.code);
                         app.handle_keys(key);
                     }
                     if app.take_just_closed_overlay() {
@@ -2064,6 +2082,12 @@ async fn run_event_loop(
                     needs_redraw = true;
                 }
                 event::Event::Paste(text) => {
+                    crate::emit_log!(
+                        "[PASTE] terminal Event::Paste chars={} newlines={} preview={:?}",
+                        text.chars().count(),
+                        text.matches('\n').count(),
+                        text.chars().take(40).collect::<String>()
+                    );
                     app.handle_paste(text);
                     needs_redraw = true;
                 }

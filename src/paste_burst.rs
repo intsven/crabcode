@@ -70,6 +70,11 @@ pub(crate) enum Burst {
 /// (Ctrl+C, Alt+b, Ctrl+Enter, ...) keeps working, and so a burst that contains
 /// a shortcut is replayed rather than silently turned into text. `Backspace` is
 /// excluded for the same reason: dropping it would silently alter the paste.
+///
+/// Only `Press`/`Repeat` count: a `Release` carries no text. Releases must
+/// still be *tolerated* while draining (see [`is_paste_release_key`]), because
+/// crossterm's Windows reader emits one per keystroke and treating them as
+/// foreign events would truncate the burst mid-paste.
 pub(crate) fn is_paste_text_key(key: &KeyEvent) -> bool {
     if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
         return false;
@@ -80,6 +85,21 @@ pub(crate) fn is_paste_text_key(key: &KeyEvent) -> bool {
         return false;
     }
     matches!(key.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab)
+}
+
+/// Whether a key is the key-up twin of a pasteable character.
+///
+/// Windows delivers `Press` + `Release` for every character, including text
+/// synthesised from a bracketed paste. If a `Release` ended the burst, the
+/// `Enter` inside a multi-line paste would arrive alone, resolve to `Replay`
+/// (below [`MIN_PASTE_KEYS`]) and be handled as a real submit. So releases are
+/// drained and discarded instead of ending collection.
+fn is_paste_release_key(key: &KeyEvent) -> bool {
+    key.kind == KeyEventKind::Release
+        && !key.modifiers.intersects(
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::META,
+        )
+        && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab)
 }
 
 /// The character a key contributes to pasted text, if any.
@@ -124,6 +144,12 @@ pub(crate) fn collect(first: KeyEvent, deferred: &mut VecDeque<Event>) -> Collec
                     max_gap = max_gap.max(now.duration_since(last_arrival));
                     last_arrival = now;
                     keys.push(key);
+                }
+                Ok(Event::Key(key)) if is_paste_release_key(&key) => {
+                    // Key-up twin of a character we just absorbed. Windows emits
+                    // one per keystroke; ending the burst here would orphan the
+                    // Enter of a multi-line paste and make it submit.
+                    last_arrival = Instant::now();
                 }
                 Ok(other) => {
                     deferred.push_back(other);
@@ -306,6 +332,53 @@ mod tests {
         let mut released = key(KeyCode::Char('a'));
         released.kind = KeyEventKind::Release;
         assert!(!is_paste_text_key(&released));
+    }
+
+    #[test]
+    fn windows_press_release_pairs_still_form_one_multiline_paste() {
+        // The real Windows stream: every character arrives as Press+Release, so
+        // a naive collector stops at the first Release and leaves the Enter of a
+        // multi-line paste orphaned -- which then submits on its own.
+        let mut keys = Vec::new();
+        for c in "ab".chars() {
+            let mut rel = key(KeyCode::Char(c));
+            rel.kind = KeyEventKind::Release;
+            keys.push(key(KeyCode::Char(c)));
+            keys.push(rel);
+        }
+        let mut rel_enter = key(KeyCode::Enter);
+        rel_enter.kind = KeyEventKind::Release;
+        keys.push(key(KeyCode::Enter));
+        keys.push(rel_enter);
+        for c in "cd".chars() {
+            let mut rel = key(KeyCode::Char(c));
+            rel.kind = KeyEventKind::Release;
+            keys.push(key(KeyCode::Char(c)));
+            keys.push(rel);
+        }
+
+        let mut releases = keys
+            .iter()
+            .filter(|k| k.kind == KeyEventKind::Release)
+            .cloned()
+            .collect::<Vec<_>>();
+        releases.clear();
+        let presses: Vec<KeyEvent> = keys
+            .into_iter()
+            .filter(|k| k.kind == KeyEventKind::Press)
+            .collect();
+        assert_eq!(resolve(tight(presses)), Burst::Paste("ab\ncd".to_string()));
+    }
+
+    #[test]
+    fn release_events_are_tolerated_while_draining() {
+        let mut rel = key(KeyCode::Char('a'));
+        rel.kind = KeyEventKind::Release;
+        assert!(is_paste_release_key(&rel));
+
+        let mut rel_ctrl = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        rel_ctrl.kind = KeyEventKind::Release;
+        assert!(!is_paste_release_key(&rel_ctrl));
     }
 
     #[test]
