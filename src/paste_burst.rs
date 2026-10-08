@@ -113,25 +113,11 @@ pub(crate) struct Collected {
 pub(crate) fn collect(first: KeyEvent, deferred: &mut VecDeque<Event>) -> Collected {
     let mut keys = vec![first];
     let mut max_gap = Duration::ZERO;
+    let mut last_arrival = Instant::now();
 
-    // Small probe window to catch chunked terminal pastes on Windows.
-    if !matches!(event::poll(Duration::from_millis(15)), Ok(true)) {
-        return Collected { keys, max_gap };
-    }
-
-    let burst_started = Instant::now();
-    let mut last_arrival = burst_started;
-
-    loop {
-        if keys.len() >= MAX_BURST_KEYS || burst_started.elapsed() >= MAX_BURST_SPAN {
-            break;
-        }
-        // Wait out the quiet window, but never past the overall burst cap.
-        let until_quiet = QUIET_WINDOW.saturating_sub(last_arrival.elapsed());
-        let until_cap = MAX_BURST_SPAN.saturating_sub(burst_started.elapsed());
-        let timeout = until_quiet.min(until_cap);
-
-        match event::poll(timeout) {
+    // Immediately drain all pending key events currently in the input queue (atomic batch drain).
+    while keys.len() < MAX_BURST_KEYS {
+        match event::poll(Duration::ZERO) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) if is_paste_text_key(&key) => {
                     let now = Instant::now();
@@ -140,8 +126,6 @@ pub(crate) fn collect(first: KeyEvent, deferred: &mut VecDeque<Event>) -> Collec
                     keys.push(key);
                 }
                 Ok(other) => {
-                    // Mouse/resize/focus: hand it back to the caller, and stop
-                    // absorbing into this burst.
                     deferred.push_back(other);
                     break;
                 }
