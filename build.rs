@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    emit_build_stamp();
     println!("cargo:rerun-if-changed=remote-client/dist/client");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -93,4 +94,13 @@ fn content_type_for_path(path: &str) -> &'static str {
         Some("woff2") => "font/woff2",
         _ => "application/octet-stream",
     }
+}
+
+fn emit_build_stamp() {
+    println!("cargo:rerun-if-env-changed=CRABCODE_BUILD_DATE");
+    let stamp = env::var("CRABCODE_BUILD_DATE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "2026-10-08T15:00Z".to_string());
+    println!("cargo:rustc-env=CRABCODE_BUILD_STAMP={stamp}");
 }

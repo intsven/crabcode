@@ -1144,7 +1144,7 @@ impl App {
 
         Ok(Self {
             running: true,
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::build_info::short_display_version(),
             input,
             command_registry: registry,
             session_manager,

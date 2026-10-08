@@ -6,6 +6,7 @@ mod aisdk;
 mod app;
 mod auth;
 mod autocomplete;
+mod build_info;
 mod command;
 mod completion;
 mod config;
@@ -769,7 +770,7 @@ pub fn get_toast_manager() -> &'static Mutex<ToastManager> {
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = crate::build_info::DISPLAY_VERSION, about, long_about = None)]
 pub(crate) struct Args {
     #[command(subcommand)]
     command: Option<Command>,
