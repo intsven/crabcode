@@ -18,6 +18,38 @@ byte-identical is what makes that harmless.
 Scope of the rules below: this workspace. They apply when the working directory
 is `D:\Programming\CrabCodeRoot` or a subdirectory with no nearer `AGENTS.md`.
 
+## Git: always push to `fork`, never to `origin`
+
+`origin` is `https://github.com/blankeos/crabcode.git`. `fork` is
+`git@github.com:intsven/crabcode.git` and is **SSH**.
+
+**Always push to `fork`.** Never push to `origin`.
+
+```powershell
+git push fork main
+```
+
+`origin` is read-only for this token. Pushing to it fails either way, but the
+HTTPS remote fails *interactively* — it prompts for credentials, so in a
+non-interactive context it hangs until interrupted rather than reporting an
+error. The SSH remote fails immediately and legibly:
+
+```
+ERROR: Permission to blankeos/crabcode.git denied to intsven.
+```
+
+So `git push` with no arguments, or `git push origin main`, is always wrong
+here: it either stalls on a prompt or reports a permission error. Go straight
+to `fork`.
+
+This is the SSH key's identity, not a transport quirk: the key authenticates
+as `intsven`, which has no write access to `blankeos/crabcode`. Adding that
+key as a write deploy key on the upstream repo would be a deliberate access
+change — do not do it unasked.
+
+Keep `origin` configured as it is; it is still the useful upstream for
+fetching and diffing, and local branches legitimately track it.
+
 ## Running crabcode: prefer `crabnew`, else `crabc`
 
 `crabnew` runs the newest published build and is immune to the exe-locking rule
