@@ -748,6 +748,142 @@ impl HistoryDAO {
         Ok(())
     }
 
+    /// Replace a session's transcript from borrowed in-memory messages.
+    ///
+    /// [`Self::replace_messages`] takes `&[Message]` of *persistence* rows,
+    /// so callers holding `&[session::types::Message]` had to deep-clone the
+    /// whole transcript into a `Vec<persistence::Message>` first. That clone
+    /// ran on the UI thread every 250ms during streaming, on transcripts
+    /// carrying tens of MB of tool metadata.
+    ///
+    /// This variant reads the borrowed messages and converts each one only as
+    /// far as SQLite needs it, serialising `parts` straight to JSON. Row
+    /// contents and aggregate updates are identical to
+    /// [`Self::replace_messages`]; only the intermediate allocation is gone.
+    pub fn replace_session_messages_from_slice(
+        &self,
+        session_id: i64,
+        messages: &[crate::session::types::Message],
+    ) -> Result<()> {
+        // One transaction for delete + inserts, matching replace_messages.
+        let tx = self.conn.unchecked_transaction()?;
+
+        tx.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            params![session_id],
+        )?;
+
+        let mut total_tokens: i64 = 0;
+        let mut total_cost = 0.0;
+        let mut updated_at = chrono::Utc::now().timestamp();
+
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO messages (
+                     id, session_id, role, parts, timestamp, tokens_used, model, provider, agent_mode, duration_ms,
+                     t0_ms, t1_ms, tn_ms, output_tokens, input_tokens, cache_read_tokens,
+                     cache_write_tokens, cost, usage_authoritative, tokens_per_sec
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            )?;
+
+            for msg in messages {
+                // Only the serialised parts are allocated; every other column
+                // is read straight out of the borrowed message.
+                let parts_json = serde_json::to_string(&msg.parts)?;
+
+                let role = match msg.role {
+                    crate::session::types::MessageRole::User => "user",
+                    crate::session::types::MessageRole::Assistant => "assistant",
+                    crate::session::types::MessageRole::System => "system",
+                    crate::session::types::MessageRole::Tool => "tool",
+                };
+                let timestamp = msg
+                    .timestamp
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                // Same derivation the From<Message> conversion applies; see
+                // persistence::conversions (compaction summaries keep the
+                // context estimate, everything else uses billed usage).
+                let usage = msg.recorded_usage();
+                let is_compaction_summary =
+                    crate::session::compaction::is_compaction_summary(msg);
+                let tokens_used: i32 = if is_compaction_summary {
+                    msg.token_count
+                        .map(|count| count.min(i32::MAX as usize) as i32)
+                        .unwrap_or(0)
+                } else {
+                    usage
+                        .map(|usage| usage.tokens().min(i32::MAX as u64) as i32)
+                        .or(msg.token_count.map(|c| c as i32))
+                        .unwrap_or(0)
+                };
+                let cost = msg.usage_cost();
+
+                total_tokens += i64::from(tokens_used);
+                total_cost += cost;
+                updated_at = timestamp;
+
+                insert.execute(params![
+                    &msg.id,
+                    session_id,
+                    role,
+                    &parts_json,
+                    timestamp,
+                    tokens_used,
+                    msg.model.as_deref(),
+                    msg.provider.as_deref(),
+                    msg.agent_mode.as_deref(),
+                    msg.duration_ms.map(|d| d as i64).unwrap_or(0),
+                    msg.t0_ms.map(|v| v as i64),
+                    msg.t1_ms.map(|v| v as i64),
+                    msg.tn_ms.map(|v| v as i64),
+                    msg.output_tokens.map(|v| v as i64),
+                    msg.input_tokens.map(|v| v as i64),
+                    msg.cache_read_tokens.map(|v| v as i64),
+                    msg.cache_write_tokens.map(|v| v as i64),
+                    msg.cost,
+                    msg.usage_authoritative,
+                    msg.tokens_per_sec,
+                ])?;
+            }
+        }
+
+        let session = self.get_session(session_id)?;
+        let total_time_sec = session
+            .as_ref()
+            .map(|session| (updated_at - session.created_at).max(0) as f64)
+            .unwrap_or(0.0);
+        let avg_tokens_per_sec = if total_time_sec > 0.0 {
+            total_tokens as f64 / total_time_sec
+        } else {
+            0.0
+        };
+
+        tx.execute(
+            "UPDATE sessions
+              SET total_tokens = ?1,
+                  total_cost = ?2,
+                  total_time_sec = ?3,
+                  avg_tokens_per_sec = ?4,
+                  updated_at = ?5
+              WHERE id = ?6",
+            params![
+                total_tokens,
+                total_cost,
+                total_time_sec,
+                avg_tokens_per_sec,
+                updated_at,
+                session_id
+            ],
+        )?;
+
+        tx.commit()?;
+
+        Ok(())
+    }
+
     pub fn replace_messages(&self, session_id: i64, messages: &[Message]) -> Result<()> {
         // A single transaction turns the delete + N inserts into one commit.
         // This runs on the UI thread every streaming snapshot, so per-statement

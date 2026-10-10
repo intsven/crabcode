@@ -837,17 +837,12 @@ impl SessionManager {
 
         if let Some(ref dao) = self.history_dao {
             if let Some(db_id) = self.id_mapping.get(session_id) {
-                let persistence_messages: Vec<crate::persistence::Message> = messages
-                    .iter()
-                    .cloned()
-                    .map(|message| {
-                        let mut db_message: crate::persistence::Message = message.into();
-                        db_message.session_id = *db_id;
-                        db_message
-                    })
-                    .collect();
-
-                dao.replace_messages(*db_id, &persistence_messages)
+                // By reference, not cloned: this runs on every streaming
+                // snapshot (4x/sec) and the transcript can hold tens of MB of
+                // tool metadata. `replace_session_messages_from_slice` reads
+                // the messages and serializes each one to JSON inline, so no
+                // intermediate Vec of persistence rows is materialised.
+                dao.replace_session_messages_from_slice(*db_id, &messages)
                     .map_err(|e| SessionError::PersistenceError(e.to_string()))?;
             }
         }

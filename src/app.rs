@@ -29,7 +29,6 @@ use crate::ui::components::find::{FindBar, FindBarAction};
 use crate::ui::components::input::Input;
 use crate::ui::components::popup::Popup;
 use crate::ui::hyperlink::{FileHyperlinkTarget, HyperlinkTarget};
-use crate::utils::git;
 
 use crate::tools::TerminalSessionEvent;
 use crate::views::agents_dialog::{
@@ -1008,9 +1007,12 @@ pub struct App {
     /// Last keyboard/mouse/paste (or Home entry). Home blink runs only briefly after this.
     last_user_activity: std::time::Instant,
     last_session_spinner_update: std::time::Instant,
-    cached_git_branch: Option<String>,
-    cached_git_branch_path: String,
-    last_git_branch_check: std::time::Instant,
+    /// Branch name for the status bar, refreshed on a worker thread.
+    ///
+    /// Reads are non-blocking: the `git` spawn happens off-thread. See
+    /// [`crate::utils::git::GitBranchCache`] for why that matters -- the old
+    /// inline lookup froze the UI ~50ms every 2s while typing.
+    git_branch: crate::utils::git::GitBranchCache,
     discovery: Option<crate::model::discovery::Discovery>,
     cached_usage_text: String,
     cached_usage_check: (usize, u64, usize),
@@ -1256,9 +1258,7 @@ impl App {
             last_animation_update: now,
             last_user_activity: now,
             last_session_spinner_update: now,
-            cached_git_branch: None,
-            cached_git_branch_path: String::new(),
-            last_git_branch_check: now,
+            git_branch: crate::utils::git::GitBranchCache::new(),
             discovery: None,
             cached_usage_text: String::new(),
             cached_usage_check: (0, 0, 0),
@@ -3311,7 +3311,8 @@ impl App {
         std::env::set_current_dir(&path)
             .with_context(|| format!("failed to switch to {}", path.display()))?;
         self.cwd = path_text.clone();
-        self.cached_git_branch_path.clear();
+        // The new workspace's branch is requested on the next render.
+        self.git_branch.request("");
         self.tool_permissions = self.tool_permissions.clone().with_workdir(path.clone());
         self.process_registry.set_workdir_blocking(&path);
         self.session_manager
@@ -3357,18 +3358,13 @@ impl App {
         })
     }
 
+    /// Branch for `cwd`, read from the worker-populated cache.
+    ///
+    /// Called from `render`, so it must never spawn a process. `request` is a
+    /// no-op once the worker is already tracking `cwd`.
     fn current_git_branch(&mut self, cwd: &str) -> Option<String> {
-        const GIT_BRANCH_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
-
-        if self.cached_git_branch_path != cwd
-            || self.last_git_branch_check.elapsed() >= GIT_BRANCH_REFRESH
-        {
-            self.cached_git_branch = git::get_branch_for_path(cwd);
-            self.cached_git_branch_path = cwd.to_string();
-            self.last_git_branch_check = std::time::Instant::now();
-        }
-
-        self.cached_git_branch.clone()
+        self.git_branch.request(cwd);
+        self.git_branch.current()
     }
 
     pub fn cycle_theme(&mut self) {
@@ -14006,9 +14002,7 @@ mod tests {
             last_animation_update: std::time::Instant::now(),
             last_user_activity: std::time::Instant::now(),
             last_session_spinner_update: std::time::Instant::now(),
-            cached_git_branch: None,
-            cached_git_branch_path: ".".to_string(),
-            last_git_branch_check: std::time::Instant::now(),
+            git_branch: crate::utils::git::GitBranchCache::new(),
             discovery: None,
             cached_usage_text: String::new(),
             cached_usage_check: (0, 0, 0),
