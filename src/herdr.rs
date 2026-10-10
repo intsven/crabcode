@@ -76,6 +76,15 @@ struct Reporter {
 
 fn env() -> Option<&'static HerdrEnv> {
     ENV.get_or_init(|| {
+        // A `cargo test` harness inherits HERDR_ENV / HERDR_PANE_ID /
+        // HERDR_SOCKET_PATH from the pane it runs in. Ungated, the test binary
+        // registers itself as that pane's agent (under its own exe stem, e.g.
+        // `crabcode-f83dd495c97f96aa`) and sends `pane.release_agent` on exit,
+        // which paints a live crabcode session as finished and fires a
+        // completion notification each run. Tests are not a TUI: never report.
+        if cfg!(test) {
+            return None;
+        }
         // herdr documents `HERDR_ENV=1` as the gate. Requiring it keeps a stray
         // pane id from being mistaken for a live pane.
         if std::env::var("HERDR_ENV").ok()? != "1" {
@@ -129,7 +138,10 @@ fn agent() -> &'static str {
             })
             .unwrap_or(DEFAULT_AGENT);
 
-        if stem.starts_with("crabcode-") && stem.len() > 9 && stem[9..].chars().all(|c| c.is_ascii_digit() || c == '-') {
+        if stem.starts_with("crabcode-")
+            && stem.len() > 9
+            && stem[9..].chars().all(|c| c.is_ascii_digit() || c == '-')
+        {
             return "crabnew".to_string();
         }
 
@@ -193,9 +205,40 @@ fn build_resume_argv(session_id: &str) -> Option<Vec<String>> {
     Some(argv)
 }
 
-/// Report the current session status to herdr (no-op outside herdr).
-pub fn report_session_status(session_id: &str, status: SessionStatus) {
-    let state = herdr_state(status);
+/// Collapse a session family (a root conversation and its sub-agent children)
+/// into the single state that describes the pane as a whole.
+///
+/// `blocked` outranks `working` because it is the only one that needs the user:
+/// a sub-agent waiting on a permission while its parent keeps streaming must
+/// not read as "working". `working` outranks `idle`, and everything that is
+/// not streaming or waiting maps to `idle` (see [`herdr_state`]), so one
+/// finished sub-agent cannot report the pane as finished while the root is
+/// still going.
+pub fn family_state(statuses: impl IntoIterator<Item = SessionStatus>) -> &'static str {
+    let mut state = "idle";
+    for status in statuses {
+        state = match (state, herdr_state(status)) {
+            (_, "blocked") => "blocked",
+            ("idle", "working") => "working",
+            (current, _) => current,
+        };
+    }
+    state
+}
+
+/// Report an already-resolved herdr state for `session_id` (no-op outside
+/// herdr). `state` must come from [`herdr_state`] or [`family_state`].
+pub fn report_state(session_id: &str, state: &'static str) {
+    // Diagnostic: herdr's own log shows the RPC arriving, but nothing records
+    // *why* crabcode decided on this state (which session, which family
+    // members). Without this, a wrong `done` is indistinguishable from a
+    // correct one. Cheap, off the hot path, and the only place that knows both.
+    crate::emit_log!(
+        "[HERDR] report state={} session={} pane={}",
+        state,
+        session_id,
+        env().map(|e| e.pane_id.as_str()).unwrap_or("-")
+    );
     if !is_active() {
         return;
     }
@@ -575,9 +618,68 @@ mod tests {
     }
 
     #[test]
+    fn family_state_reports_working_while_any_subagent_streams() {
+        // The bug: a sub-agent finishing set the pane to idle even though the
+        // root conversation was still streaming.
+        assert_eq!(
+            family_state([SessionStatus::Streaming, SessionStatus::Idle]),
+            "working"
+        );
+        assert_eq!(
+            family_state([SessionStatus::Idle, SessionStatus::Streaming]),
+            "working"
+        );
+    }
+
+    #[test]
+    fn family_state_reports_blocked_when_any_session_waits() {
+        // A sub-agent on a permission prompt must outrank the parent's
+        // streaming: it is the one state that needs the user.
+        assert_eq!(
+            family_state([SessionStatus::Streaming, SessionStatus::Waiting]),
+            "blocked"
+        );
+        assert_eq!(
+            family_state([SessionStatus::Idle, SessionStatus::Waiting]),
+            "blocked"
+        );
+        assert_eq!(
+            family_state([SessionStatus::Waiting, SessionStatus::Streaming]),
+            "blocked"
+        );
+    }
+
+    #[test]
+    fn family_state_is_idle_once_everything_settled() {
+        assert_eq!(family_state([]), "idle");
+        assert_eq!(
+            family_state([SessionStatus::Idle, SessionStatus::Idle]),
+            "idle"
+        );
+        assert_eq!(
+            family_state([SessionStatus::Idle, SessionStatus::Failed]),
+            "idle"
+        );
+        assert_eq!(
+            family_state([SessionStatus::Interrupted, SessionStatus::Idle]),
+            "idle"
+        );
+    }
+
+    #[test]
     fn inactive_without_env() {
         // Tests run outside herdr; env should be unset.
         assert!(!is_active() || env().is_some());
+    }
+
+    #[test]
+    fn a_test_binary_never_registers_as_a_pane_agent() {
+        // Regression: running `cargo test` inside a herdr pane used to register
+        // the test harness as that pane's agent, then release it on exit --
+        // marking a still-running crabcode session finished and notifying.
+        // See the `cfg!(test)` guard in `env`.
+        assert!(cfg!(test));
+        assert!(!is_active(), "test builds must never report to herdr");
     }
 
     #[test]
@@ -672,7 +774,11 @@ mod tests {
 
         // Mirrors mark_reported's contract against a local slot, so the test
         // does not race the process-wide LAST_STATE used by other tests.
-        fn mark(slot: &Mutex<Option<(&'static str, String)>>, state: &'static str, id: &str) -> bool {
+        fn mark(
+            slot: &Mutex<Option<(&'static str, String)>>,
+            state: &'static str,
+            id: &str,
+        ) -> bool {
             let key = (state, id.to_string());
             let mut guard = slot.lock().unwrap();
             if guard.as_ref() == Some(&key) {

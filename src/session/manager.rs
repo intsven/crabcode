@@ -418,7 +418,7 @@ impl SessionManager {
         // herdr would keep showing the previous session's id (and resume
         // command) until the first turn. Report it as soon as it is current.
         if make_current {
-            crate::herdr::report_session_status(&session_id, SessionStatus::Idle);
+            self.report_herdr_family(&session_id);
         }
 
         session_id
@@ -559,12 +559,7 @@ impl SessionManager {
         if self.sessions.contains_key(id) {
             let _ = self.hydrate_session(id);
             self.current_session_id = Some(id.to_string());
-            let status = self
-                .sessions
-                .get(id)
-                .map(|s| s.status)
-                .unwrap_or(SessionStatus::Idle);
-            crate::herdr::report_session_status(id, status);
+            self.report_herdr_family(id);
             true
         } else {
             false
@@ -573,6 +568,55 @@ impl SessionManager {
 
     pub fn get_current_session_id(&self) -> Option<&String> {
         self.current_session_id.as_ref()
+    }
+
+    /// Tell herdr what the pane holding this session's family is doing.
+    ///
+    /// A sub-agent is a full session that can take the focused tab, so
+    /// reporting the focused session alone let a sub-agent's `idle` mark the
+    /// pane finished while the root was still streaming. The pane is one
+    /// conversation, so report the root's id (which is also what a resume
+    /// should reopen) and the strongest state across the whole family.
+    fn report_herdr_family(&self, id: &str) {
+        if !crate::herdr::is_active() {
+            return;
+        }
+        if let Some((root_id, state)) = self.herdr_family_state(id) {
+            crate::herdr::report_state(&root_id, state);
+        }
+    }
+
+    /// The `(root id, herdr state)` a pane holding this session should show.
+    fn herdr_family_state(&self, id: &str) -> Option<(String, &'static str)> {
+        let Some(root_id) = self.root_session_id_for(id) else {
+            return None;
+        };
+        let root_status = self
+            .sessions
+            .get(&root_id)
+            .map(|s| s.status)
+            .unwrap_or(SessionStatus::Idle);
+        let descendants = self.descendant_sessions(&root_id);
+        let state = crate::herdr::family_state(
+            std::iter::once(root_status).chain(descendants.iter().map(|session| session.status)),
+        );
+        // Diagnostic: when a pane is wrongly marked finished, the whole family
+        // is needed to see which member lied -- not just the aggregate.
+        let contributors: Vec<String> = std::iter::once(root_id.clone())
+            .chain(std::iter::once(format!("<self>={:?}", root_status)))
+            .chain(
+                descendants
+                    .iter()
+                    .map(|session| format!("{}={:?}", session.id, session.status)),
+            )
+            .collect();
+        crate::emit_log!(
+            "[HERDR_FAMILY] root={} state={} family=[{}]",
+            root_id,
+            state,
+            contributors.join(", ")
+        );
+        Some((root_id, state))
     }
 
     pub fn current_workspace_id(&self) -> i64 {
@@ -837,12 +881,17 @@ impl SessionManager {
 
         if let Some(ref dao) = self.history_dao {
             if let Some(db_id) = self.id_mapping.get(session_id) {
-                // By reference, not cloned: this runs on every streaming
-                // snapshot (4x/sec) and the transcript can hold tens of MB of
-                // tool metadata. `replace_session_messages_from_slice` reads
-                // the messages and serializes each one to JSON inline, so no
-                // intermediate Vec of persistence rows is materialised.
-                dao.replace_session_messages_from_slice(*db_id, &messages)
+                let persistence_messages: Vec<crate::persistence::Message> = messages
+                    .iter()
+                    .cloned()
+                    .map(|message| {
+                        let mut db_message: crate::persistence::Message = message.into();
+                        db_message.session_id = *db_id;
+                        db_message
+                    })
+                    .collect();
+
+                dao.replace_messages(*db_id, &persistence_messages)
                     .map_err(|e| SessionError::PersistenceError(e.to_string()))?;
             }
         }
@@ -878,9 +927,22 @@ impl SessionManager {
             }
         }
 
-        // Only the active pane session drives herdr's agent state.
-        if self.current_session_id.as_deref() == Some(id) {
-            crate::herdr::report_session_status(id, status);
+        // Only the session family shown in the pane drives herdr's agent state.
+        // A background sub-agent starting or finishing still changes what the
+        // pane should say, so membership in the current family is the test --
+        // not identity with the focused tab.
+        let in_current_family = match self.current_session_id.as_deref() {
+            Some(current) => match (
+                self.root_session_id_for(current),
+                self.root_session_id_for(id),
+            ) {
+                (Some(current_root), Some(id_root)) => current_root == id_root,
+                _ => false,
+            },
+            None => false,
+        };
+        if in_current_family {
+            self.report_herdr_family(id);
         }
 
         Ok(())
@@ -1094,6 +1156,72 @@ mod tests {
         assert!(manager.sessions.is_empty());
         assert!(manager.current_session_id.is_none());
         assert_eq!(manager.session_counter, 0);
+    }
+
+    #[test]
+    fn herdr_family_state_follows_the_root_not_the_focused_subagent() {
+        let mut manager = SessionManager::new();
+        let root = manager.create_session(Some("root".to_string()));
+        let child =
+            manager.create_child_session(root.clone(), "child-a".to_string(), "A".to_string());
+
+        // Root streaming, sub-agent finished: the pane is still working.
+        manager
+            .set_session_status(&root, SessionStatus::Streaming, None)
+            .unwrap();
+        manager
+            .set_session_status(&child, SessionStatus::Idle, None)
+            .unwrap();
+        assert_eq!(
+            manager.herdr_family_state(&child),
+            Some((root.clone(), "working"))
+        );
+
+        // A sub-agent waiting on a permission outranks the root's streaming.
+        manager
+            .set_session_status(&child, SessionStatus::Waiting, None)
+            .unwrap();
+        assert_eq!(
+            manager.herdr_family_state(&child),
+            Some((root.clone(), "blocked"))
+        );
+
+        // Everything settled: idle, and the report still names the root so a
+        // resume reopens the conversation rather than the sub-agent.
+        manager
+            .set_session_status(&child, SessionStatus::Idle, None)
+            .unwrap();
+        manager
+            .set_session_status(&root, SessionStatus::Idle, None)
+            .unwrap();
+        assert_eq!(
+            manager.herdr_family_state(&child),
+            Some((root.clone(), "idle"))
+        );
+    }
+
+    #[test]
+    fn herdr_family_state_includes_nested_subagents() {
+        let mut manager = SessionManager::new();
+        let root = manager.create_session(Some("root".to_string()));
+        let child =
+            manager.create_child_session(root.clone(), "child-a".to_string(), "A".to_string());
+        let grandchild =
+            manager.create_child_session(child.clone(), "child-a1".to_string(), "A1".to_string());
+
+        manager
+            .set_session_status(&root, SessionStatus::Idle, None)
+            .unwrap();
+        manager
+            .set_session_status(&child, SessionStatus::Idle, None)
+            .unwrap();
+        manager
+            .set_session_status(&grandchild, SessionStatus::Streaming, None)
+            .unwrap();
+        assert_eq!(
+            manager.herdr_family_state(&root),
+            Some((root.clone(), "working"))
+        );
     }
 
     #[test]
