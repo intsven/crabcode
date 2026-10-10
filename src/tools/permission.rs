@@ -3,6 +3,7 @@ use crate::tools::ToolError;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -1181,14 +1182,93 @@ fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
+/// Windows `canonicalize` returns verbatim (`\\?\`) paths. Stripping the prefix
+/// keeps both sides of a containment check in the same textual shape.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    let Some(rest) = text.strip_prefix(r"\\?\") else {
+        return path;
+    };
+    match rest.strip_prefix("UNC\\") {
+        Some(unc) => PathBuf::from(format!(r"\\{unc}")),
+        None => PathBuf::from(rest),
+    }
+}
+
+/// Resolves `path` as fully as the filesystem allows, then normalizes the result
+/// into one textual shape regardless of whether `path` exists yet.
+///
+/// Canonicalizing the nearest existing ancestor — instead of falling back to a
+/// purely lexical result when `path` is missing — is what makes a *new* file
+/// inside the workdir compare equal to the workdir itself. It also resolves
+/// symlinked and junctioned parents, which the lexical fallback silently
+/// treated as if they were real subdirectories.
 fn canonical_or_normalized(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
+    let normalized = normalize_path(path);
+
+    let mut existing: &Path = &normalized;
+    let mut trailing: Vec<&OsStr> = Vec::new();
+    loop {
+        if existing.as_os_str().is_empty() {
+            break;
+        }
+        if let Ok(canonical) = std::fs::canonicalize(existing) {
+            let canonical = strip_verbatim_prefix(canonical);
+            // Windows resolves a root-relative path against the *current drive*,
+            // so canonicalizing `/tmp` yields `D:\tmp`. Trusting that would
+            // silently relocate the path to a different root than the caller
+            // named, which is worse than not resolving it at all. Only use the
+            // canonical form when it still refers to the ancestor we asked for.
+            if !normalize_path(existing).starts_with(&canonical) {
+                break;
+            }
+            let mut out = canonical;
+            for component in trailing.iter().rev() {
+                out.push(component);
+            }
+            return out;
+        }
+
+        let Some(file_name) = existing.file_name() else {
+            break;
+        };
+        let Some(parent) = existing.parent() else {
+            break;
+        };
+        if parent.as_os_str().is_empty() || parent == existing {
+            break;
+        }
+        trailing.push(file_name);
+        existing = parent;
+    }
+
+    normalized
+}
+
+/// Case-insensitive on Windows, where `C:\Foo` and `c:\foo` are the same
+/// directory; case-sensitive elsewhere.
+fn path_starts_with(target: &Path, base: &Path) -> bool {
+    if target.starts_with(base) {
+        return true;
+    }
+    if !cfg!(windows) {
+        return false;
+    }
+
+    let target_lower = target.to_string_lossy().to_lowercase();
+    let base_lower = base.to_string_lossy().to_lowercase();
+    target_lower == base_lower
+        || target_lower
+            .strip_prefix(base_lower.as_str())
+            .is_some_and(|rest| rest.starts_with('\\') || rest.starts_with('/'))
 }
 
 pub fn is_outside_workdir(path: &Path, workdir: &Path) -> bool {
     let target = canonical_or_normalized(path);
     let base = canonical_or_normalized(workdir);
-    !target.starts_with(base)
+    !path_starts_with(&target, &base)
 }
 
 pub fn is_sensitive_path(path: &Path) -> bool {
@@ -1274,6 +1354,64 @@ mod tests {
             Path::new("/tmp/elsewhere/file.txt"),
             &wd
         ));
+    }
+
+    /// A `write` target normally does not exist yet, which is exactly when the
+    /// old lexical fallback used to disagree with the canonicalized workdir.
+    #[test]
+    fn new_files_inside_an_existing_workdir_are_not_external() {
+        let base = std::env::temp_dir().join(format!("crabcode-perm-new-{}", std::process::id()));
+        let workdir = base.join("workspace");
+        std::fs::create_dir_all(workdir.join("src")).expect("create workdir");
+
+        for target in [
+            workdir.join("brand-new-file.txt"),
+            workdir.join("src").join("also-new.rs"),
+            workdir.join("src").join("deeply").join("nested.txt"),
+        ] {
+            assert!(
+                !is_outside_workdir(&target, &workdir),
+                "{target:?} should be inside {workdir:?}"
+            );
+        }
+
+        assert!(is_outside_workdir(&base.join("outside.txt"), &workdir));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The invariant the bug violated: existing and not-yet-created siblings
+    /// must resolve to the same shape so only the file name differs.
+    #[test]
+    fn existing_and_new_paths_resolve_to_the_same_shape() {
+        let dir = std::env::temp_dir().join(format!("crabcode-perm-shape-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let existing = dir.join("exists.txt");
+        std::fs::write(&existing, "x").expect("write existing file");
+
+        let existing_resolved = canonical_or_normalized(&existing);
+        let new_resolved = canonical_or_normalized(&dir.join("not-created-yet.txt"));
+
+        assert_eq!(
+            existing_resolved.parent(),
+            new_resolved.parent(),
+            "existing {existing_resolved:?} vs new {new_resolved:?}"
+        );
+        assert_eq!(existing_resolved.file_name().unwrap(), "exists.txt");
+        assert_eq!(new_resolved.file_name().unwrap(), "not-created-yet.txt");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `canonicalize` is drive-relative for root-relative inputs on Windows, so
+    /// a POSIX-style path must not be silently relocated onto the current drive.
+    #[test]
+    fn root_relative_paths_are_not_relocated_onto_the_current_drive() {
+        let resolved = canonical_or_normalized(Path::new("/tmp/workspace/file.txt"));
+        assert!(
+            !resolved.starts_with(r"C:\"),
+            "root-relative path was relocated to {resolved:?}"
+        );
     }
 
     #[test]
