@@ -11,6 +11,7 @@ mod command;
 mod completion;
 mod config;
 mod herdr;
+mod input_lag_harness;
 mod jobs;
 mod llm;
 mod logging;
@@ -819,6 +820,11 @@ pub(crate) struct Args {
     #[arg(long = "test-paste-base64", hide = true)]
     test_paste_base64: Option<String>,
 
+    /// Headless input-lag benchmark: measures keystroke latency while the
+    /// agent loop streams.
+    #[arg(long = "test-input-lag", hide = true)]
+    test_input_lag: bool,
+
     /// The prompt to run (positional, used in print mode)
     prompt: Vec<String>,
 }
@@ -1293,6 +1299,11 @@ async fn main() -> Result<()> {
             eprintln!("TEST_PASTE_FAILURE: expected {:?}, got {:?}", expected, input_text);
             std::process::exit(1);
         }
+    }
+
+    if args.test_input_lag {
+        let code = crate::input_lag_harness::run(&mut app);
+        std::process::exit(code);
     }
     // Keep herdr authority until this guard drops (normal exit or panic).
     let _herdr = crate::herdr::Session::start();

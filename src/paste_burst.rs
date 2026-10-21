@@ -190,7 +190,29 @@ pub(crate) fn resolve(collected: Collected) -> Burst {
         }
     }
 
-    if text.contains('\n') || max_gap <= QUIET_WINDOW {
+    // A newline that is followed by more text can only be pasted text: a
+    // human pressing Enter in the input box submits, it does not continue
+    // the line. This keeps a multi-line paste that arrives slowly (a big
+    // paste trickling in over a slow link) from submitting its first line.
+    let inner_newline = text.trim_end_matches('\n').contains('\n');
+    if inner_newline {
+        return Burst::Paste(text);
+    }
+
+    // The burst ends with an Enter and nothing else. That Enter is a submit,
+    // not pasted text: replaying the burst submits the message the way the
+    // user meant it.
+    //
+    // It used to be classified as a paste, which inserted a newline into the
+    // input box instead of starting the agent loop. The timing signal cannot
+    // tell the two apart: while the agent loop is running the UI thread is
+    // busy, the keys queue up, and the burst is drained back to back -- the
+    // gap looks like a paste even though the user typed every character.
+    if text.ends_with('\n') {
+        return Burst::Replay(keys);
+    }
+
+    if max_gap <= QUIET_WINDOW {
         return Burst::Paste(text);
     }
 
@@ -240,10 +262,35 @@ mod tests {
     }
 
     #[test]
-    fn two_key_paste_with_newline_is_not_replayed() {
-        // Replaying this would submit on the Enter.
+    fn a_trailing_enter_is_a_submit_not_pasted_text() {
+        // The burst ends with an Enter and nothing follows it, so the Enter is
+        // a submit. Treating it as pasted text inserted a newline into the
+        // input box instead of starting the agent loop.
         let burst = resolve(tight(vec![key(KeyCode::Char('a')), key(KeyCode::Enter)]));
-        assert_eq!(burst, Burst::Paste("a\n".to_string()));
+        match burst {
+            Burst::Replay(keys) => assert_eq!(keys.len(), 2),
+            other => panic!("expected replay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_trailing_enter_after_typed_text_is_a_submit_even_when_it_arrives_fast() {
+        // The user typed "hello" and pressed Enter. While the agent loop is
+        // running the UI thread is busy, the keys queue up and the burst is
+        // drained back to back, so the timing signal looks like a paste.
+        // The Enter must still submit.
+        let burst = resolve(tight(vec![
+            key(KeyCode::Char('h')),
+            key(KeyCode::Char('e')),
+            key(KeyCode::Char('l')),
+            key(KeyCode::Char('l')),
+            key(KeyCode::Char('o')),
+            key(KeyCode::Enter),
+        ]));
+        match burst {
+            Burst::Replay(keys) => assert_eq!(keys.len(), 6),
+            other => panic!("expected replay, got {other:?}"),
+        }
     }
 
     #[test]

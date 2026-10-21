@@ -12,6 +12,14 @@ use ratatui::{
 /// This implements the "Simple Caching Strategy" from the streaming markdown plan.
 /// It only re-parses when the content changes, not every render call.
 ///
+/// Rendering is *incremental*: the part of the stream that is already
+/// terminated (every block that ends at a blank line) is rendered once and
+/// kept, and only the block that is still growing is re-rendered on a
+/// refresh. Re-rendering the whole message on every refresh is what made
+/// typing in the input box stutter while the agent loop was running: the
+/// markdown render of a long answer costs tens of milliseconds, and it ran
+/// on the same thread that handles key events.
+///
 /// Note: Due to version incompatibility between tui-markdown (uses ratatui-core)
 /// and our ratatui version, we store content and render it directly.
 #[derive(Debug, Clone)]
@@ -23,6 +31,94 @@ pub struct SimpleStreamingRenderer {
     cached_width: usize,
     cached_colors_hash: u64,
     last_rendered_at: Option<std::time::Instant>,
+    /// Number of lines in `cached_lines` that belong to the committed blocks.
+    /// The lines after them belong to the block that is still growing.
+    committed_line_count: usize,
+    /// The byte ranges of the committed blocks, in order. Their rendered
+    /// lines live in `cached_lines`, at `committed_line_count`.
+    committed_blocks: Vec<(usize, usize)>,
+}
+
+/// Where the time of a markdown render goes. Used by the input lag harness
+/// to tell the parser apart from the line conversion.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct MarkdownProfile {
+    pub parse_us: u128,
+    pub convert_us: u128,
+    pub join_us: u128,
+    pub wrap_us: u128,
+    pub lines: usize,
+}
+
+pub(crate) fn profile_markdown(
+    markdown: &str,
+    max_width: usize,
+    colors: &ThemeColors,
+) -> MarkdownProfile {
+    let max_width = max_width.max(1);
+    let options = tui_markdown::Options::new(MarkdownStyleSheet::new(*colors));
+    let started = std::time::Instant::now();
+    let text = tui_markdown::from_str_with_options(markdown, &options);
+    let parse_us = started.elapsed().as_micros();
+
+    let started = std::time::Instant::now();
+    let mut themed_lines = Vec::new();
+    let mut in_code_block = false;
+    for line in text.lines {
+        let mut converted_line = convert_line(line);
+        apply_markdown_theme(&mut converted_line, &mut in_code_block, colors);
+        themed_lines.push(converted_line);
+    }
+    let convert_us = started.elapsed().as_micros();
+
+    let started = std::time::Instant::now();
+    let joined = join_detached_list_markers(themed_lines);
+    let join_us = started.elapsed().as_micros();
+
+    let started = std::time::Instant::now();
+    let mut result = Vec::new();
+    for converted_line in joined {
+        let line_str = line_to_string(&converted_line);
+        let line_width = unicode_width::UnicodeWidthStr::width(line_str.as_str());
+        if line_width <= max_width || is_preprocessed_table_line(&line_str) {
+            result.push(converted_line);
+        } else {
+            let indent_style = converted_line
+                .spans
+                .first()
+                .map(|span| span.style)
+                .unwrap_or_else(|| Style::default().fg(colors.markdown_text));
+            let continuation_indent = markdown_continuation_indent(&line_str, indent_style);
+            let wrapped = wrap_styled_line(
+                &converted_line,
+                WrapOptions::new(max_width).subsequent_indent(continuation_indent),
+            );
+            result.extend(wrapped);
+        }
+    }
+    let wrap_us = started.elapsed().as_micros();
+
+    MarkdownProfile {
+        parse_us,
+        convert_us,
+        join_us,
+        wrap_us,
+        lines: result.len(),
+    }
+}
+
+/// Whether a line starts a list item.
+fn is_list_item_line(trimmed: &str) -> bool {
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        return true;
+    }
+    is_ordered_list_item_line(trimmed)
+}
+
+/// Whether a line starts an ordered list item.
+fn is_ordered_list_item_line(trimmed: &str) -> bool {
+    let digits = trimmed.bytes().take_while(|byte| byte.is_ascii_digit()).count();
+    digits > 0 && trimmed[digits..].starts_with(". ")
 }
 
 const SHORT_STREAM_MARKDOWN_RENDER_INTERVAL: std::time::Duration =
@@ -44,6 +140,8 @@ impl SimpleStreamingRenderer {
             cached_width: 0,
             cached_colors_hash: 0,
             last_rendered_at: None,
+            committed_line_count: 0,
+            committed_blocks: Vec::new(),
         }
     }
 
@@ -56,6 +154,8 @@ impl SimpleStreamingRenderer {
         self.cached_width = 0;
         self.cached_colors_hash = 0;
         self.last_rendered_at = None;
+        self.committed_line_count = 0;
+        self.committed_blocks.clear();
     }
 
     /// Append new content from the stream
@@ -126,12 +226,208 @@ impl SimpleStreamingRenderer {
             return false;
         }
 
-        self.cached_lines = render_markdown(&self.content, max_width, colors);
+        if render_config_changed {
+            // Width or theme changed: the committed lines were rendered with
+            // the old settings and cannot be reused.
+            self.committed_line_count = 0;
+            self.committed_blocks.clear();
+            self.cached_lines.clear();
+        }
+
+        self.render_incremental(max_width, colors);
         self.cached_width = max_width;
         self.cached_colors_hash = colors_hash;
         self.mark_rendered();
         true
     }
+
+    /// Render only what changed.
+    ///
+    /// Blocks that are already terminated are rendered once and kept; the
+    /// block that is still growing is re-rendered on every refresh. The cost
+    /// of a refresh therefore tracks the size of the growing block instead of
+    /// the size of the whole answer.
+    fn render_incremental(&mut self, max_width: usize, colors: &ThemeColors) {
+        if self.contains_table {
+            // A table is rendered by a separate pre-processing step that does
+            // not keep the empty line between the blocks, so a document with
+            // a table is rendered in one go.
+            self.committed_line_count = 0;
+            self.committed_blocks.clear();
+            self.cached_lines = render_markdown(&self.content, max_width, colors);
+            return;
+        }
+
+        let blocks = split_blocks(&self.content);
+        let committed_count = blocks.len().saturating_sub(1);
+
+        // The ranges of the committed blocks never change, because the
+        // content only grows. A change means the cache was invalidated.
+        let ranges_changed = self.committed_blocks.len() > committed_count
+            || self
+                .committed_blocks
+                .iter()
+                .zip(blocks.iter())
+                .any(|((start, end), block)| *start != block.start || *end != block.end);
+        if ranges_changed {
+            self.committed_blocks.clear();
+            self.cached_lines.clear();
+            self.committed_line_count = 0;
+        }
+
+        // Drop the lines of the block that was still growing: it is either
+        // committed now (and re-rendered below) or replaced by the new tail.
+        self.cached_lines.truncate(self.committed_line_count);
+
+        for (index, block) in blocks.iter().take(committed_count).enumerate() {
+            if index < self.committed_blocks.len() {
+                continue;
+            }
+            let lines = render_markdown(
+                &self.content[block.start..block.end],
+                max_width,
+                colors,
+            );
+            if self.committed_line_count > 0 {
+                // The empty line that separates two blocks.
+                self.cached_lines.push(Line::default());
+            }
+            self.cached_lines.extend(lines);
+            self.committed_line_count = self.cached_lines.len();
+            self.committed_blocks.push((block.start, block.end));
+        }
+
+        // The block that is still growing is re-rendered on every refresh.
+        if let Some(tail) = blocks.last() {
+            let lines = render_markdown(&self.content[tail.start..tail.end], max_width, colors);
+            if self.committed_line_count > 0 {
+                self.cached_lines.push(Line::default());
+            }
+            self.cached_lines.extend(lines);
+        }
+    }
+}
+
+/// A top level block of a markdown document.
+#[derive(Debug, Clone, Copy)]
+struct Block {
+    /// Byte offset of the first line of the block.
+    start: usize,
+    /// Byte offset behind the last line of the block. The blank lines that
+    /// separate the block from the next one are not part of it.
+    end: usize,
+}
+
+/// Split a markdown document into its top level blocks.
+///
+/// A block ends at a blank line, except inside a fenced code block (a blank
+/// line does not end a code block) and inside a list (a blank line between
+/// two items does not end the list). Splitting there is what makes the
+/// incremental render possible: every block but the last one is finished and
+/// can be rendered once and kept.
+fn split_blocks(content: &str) -> Vec<Block> {
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut fence: Option<(u8, usize)> = None;
+
+    let mut offset = 0usize;
+    let mut block_start: Option<usize> = None;
+    let mut block_end = 0usize;
+    // The list that is currently open, if any: `Some(true)` for an ordered
+    // list, `Some(false)` for an unordered one.
+    let mut open_list: Option<bool> = None;
+
+    for line in content.split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        let trimmed = line.trim_start();
+        let is_blank = trimmed.is_empty();
+        let is_indented = line.starts_with(' ') || line.starts_with('\t');
+        let is_item = !is_indented && is_list_item_line(trimmed);
+        let ordered = is_ordered_list_item_line(trimmed);
+
+        if let Some((marker, length)) = fence {
+            // Inside a fenced code block: every line belongs to the block.
+            if block_start.is_none() {
+                block_start = Some(line_start);
+            }
+            block_end = trim_line_break(offset, line);
+            let count = trimmed.bytes().take_while(|byte| *byte == marker).count();
+            if count >= length && trimmed[count..].trim().is_empty() {
+                fence = None;
+            }
+            continue;
+        }
+
+        if is_blank {
+            if open_list.is_none() {
+                // The block ends before the blank line.
+                if let Some(start) = block_start.take() {
+                    blocks.push(Block { start, end: block_end });
+                }
+            }
+            // A blank line inside a list does not end it: the next line
+            // decides whether the list continues.
+            continue;
+        }
+
+        let continues_list = match open_list {
+            Some(list_ordered) => is_indented || (is_item && ordered == list_ordered),
+            None => false,
+        };
+
+        if block_start.is_none() {
+            block_start = Some(line_start);
+        } else if open_list.is_some() && !continues_list {
+            // The list ended before this line.
+            let start = block_start.take().expect("block start");
+            blocks.push(Block { start, end: block_end });
+            block_start = Some(line_start);
+        }
+        block_end = trim_line_break(offset, line);
+
+        if is_item {
+            open_list = Some(ordered);
+        } else if !is_indented {
+            open_list = None;
+        }
+
+        if let Some((marker, length)) = fence_marker(trimmed) {
+            fence = Some((marker, length));
+        }
+    }
+
+    if let Some(start) = block_start {
+        blocks.push(Block { start, end: block_end });
+    }
+
+    blocks
+}
+
+/// The end of a line without its line break.
+fn trim_line_break(offset: usize, line: &str) -> usize {
+    if line.ends_with('\n') {
+        offset - 1
+    } else {
+        offset
+    }
+}
+
+/// The fence a line opens, if any: a run of at least three backticks or
+/// tildes at the start of the line.
+fn fence_marker(trimmed: &str) -> Option<(u8, usize)> {
+    let marker = trimmed.as_bytes().first().copied()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+    let length = trimmed.bytes().take_while(|byte| *byte == marker).count();
+    if length < 3 {
+        return None;
+    }
+    // A backtick fence's info string may not contain a backtick.
+    if marker == b'`' && trimmed[length..].contains('`') {
+        return None;
+    }
+    Some((marker, length))
 }
 
 fn streaming_markdown_render_interval(
@@ -716,6 +1012,159 @@ mod tests {
         assert!(renderer.content.is_empty());
         assert!(renderer.needs_render());
     }
+
+    /// The incremental render has to be indistinguishable from rendering the
+    /// whole document in one go: the committed blocks and the growing tail
+    /// are rendered separately, and the result must still be the same.
+    #[test]
+    fn incremental_render_matches_full_render() {
+        let documents = [
+            "Hello world",
+            "Para one.\n\nPara two.",
+            "# Heading\n\nText with **bold**.\n\n- a\n- b\n\n```rust\nfn main() {}\n```\n\nAfter the code.",
+            "line one\nline two\n\nsecond block",
+            "> quote\n\n> another quote",
+            "| A | B |\n| --- | --- |\n| 1 | 2 |\n\nafter the table",
+            "text\n\n    indented code\n\nmore",
+            "- item\n\n  continued\n\nnext",
+            "text\n\n---\n\nmore",
+            "1. first\n\n2. second\n\n3. third",
+            "```\ncode\n\nstill code\n```\n\nafter",
+            "trailing blank lines\n\n\n",
+            "- a\n\n- b\n\n- c",
+            "1. a\n\n- b\n\ntext",
+            "text\n\n- a\n\n  nested\n\n- b",
+            "```rust\nfn a() {}\n\nfn b() {}\n```\n\nafter",
+            "## Head\n\n- one\n- two\n\n### Sub\n\ntext",
+            "a\n\nb\n\nc\n\nd",
+            "Para with a very long line that has to be wrapped because it is much wider than the terminal is.",
+        ];
+
+        for document in documents {
+            let expected = render_markdown(document, 80, &test_colors());
+            for chunk_size in [1usize, 2, 5, 17] {
+                let mut renderer = SimpleStreamingRenderer::new();
+                let chars: Vec<char> = document.chars().collect();
+                for chunk in chars.chunks(chunk_size) {
+                    renderer.append(&chunk.iter().collect::<String>());
+                    renderer.ensure_rendered(80, &test_colors(), true);
+                }
+                assert_eq!(
+                    renderer.cached_lines, expected,
+                    "document {document:?} with chunk size {chunk_size}"
+                );
+            }
+        }
+    }
+
+    /// The renderer puts exactly one empty line between two top level blocks.
+    /// The incremental render relies on that: it renders the committed blocks
+    /// and the growing tail separately and joins them with that line.
+    ///
+    /// A table is not part of the matrix: tables are rendered by a separate
+    /// pre-processing step that does not keep the empty line, and a document
+    /// with a table is rendered in one go.
+    #[test]
+    fn blocks_are_separated_by_one_empty_line() {
+        let blocks = [
+            "Paragraph.",
+            "# Heading",
+            "- item one\n- item two",
+            "1. first\n2. second",
+            "> quoted",
+            "```rust\nfn main() {}\n```",
+            "---",
+            "    indented code",
+            "text with **bold**",
+        ];
+        for first in blocks {
+            for second in blocks {
+                if first.starts_with("- ") && second.starts_with("- ")
+                    || first.starts_with("1. ") && second.starts_with("1. ")
+                {
+                    // Two lists of the same type merge into one list.
+                    continue;
+                }
+                if second.starts_with(' ') || second.starts_with('\t') {
+                    // An indented block after a list continues the list, it
+                    // is not an indented code block of its own.
+                    continue;
+                }
+                let full = render_markdown(&format!("{first}\n\n{second}"), 80, &test_colors());
+                let mut expected = render_markdown(first, 80, &test_colors());
+                expected.push(Line::default());
+                expected.extend(render_markdown(second, 80, &test_colors()));
+                assert_eq!(full, expected, "first {first:?} second {second:?}");
+            }
+        }
+    }
+
+    /// A refresh must not re-render the blocks that are already finished:
+    /// the committed prefix is what keeps the render cost proportional to
+    /// the text that just arrived.
+    #[test]
+    fn finished_blocks_are_committed_and_not_re_rendered() {
+        let mut renderer = SimpleStreamingRenderer::new();
+        renderer.append("First paragraph.\n\nSecond");
+        renderer.ensure_rendered(80, &test_colors(), true);
+        assert_eq!(
+            renderer.committed_blocks.len(),
+            1,
+            "the finished block should be committed"
+        );
+
+        renderer.append(" paragraph.\n\nThird");
+        renderer.ensure_rendered(80, &test_colors(), true);
+        assert!(
+            renderer.committed_blocks.len() > 1,
+            "the second block should be committed as well"
+        );
+    }
+
+    /// A block that is still growing must not be committed: the tail is
+    /// re-rendered on every refresh.
+    #[test]
+    fn the_growing_block_is_not_committed() {
+        let mut renderer = SimpleStreamingRenderer::new();
+        renderer.append("Still growing");
+        renderer.ensure_rendered(80, &test_colors(), true);
+        assert!(renderer.committed_blocks.is_empty());
+        assert_eq!(renderer.committed_line_count, 0);
+    }
+
+    /// A blank line inside a fenced code block does not end the block.
+    #[test]
+    fn a_fenced_code_block_is_one_block() {
+        let content = "```rust\nfn main() {}\n\nstill inside the fence\n```\n\nafter";
+        let blocks = split_blocks(content);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(
+            &content[blocks[0].start..blocks[0].end],
+            "```rust\nfn main() {}\n\nstill inside the fence\n```"
+        );
+        assert!(content[blocks[1].start..blocks[1].end].starts_with("after"));
+    }
+
+    /// A blank line between two list items does not end the list.
+    #[test]
+    fn a_list_is_one_block() {
+        let content = "- a\n\n- b\n\nnext";
+        let blocks = split_blocks(content);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(&content[blocks[0].start..blocks[0].end], "- a\n\n- b");
+        assert_eq!(&content[blocks[1].start..blocks[1].end], "next");
+    }
+
+    /// A change of the marker type starts a new list.
+    #[test]
+    fn a_different_marker_type_starts_a_new_list() {
+        let content = "1. a\n\n- b";
+        let blocks = split_blocks(content);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(&content[blocks[0].start..blocks[0].end], "1. a");
+        assert_eq!(&content[blocks[1].start..blocks[1].end], "- b");
+    }
+
 
     #[test]
     fn test_render_markdown_basic() {
